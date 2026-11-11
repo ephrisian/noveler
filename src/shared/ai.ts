@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AiChatRequest, AiChatResponse, AiLocalData, AiSettings } from './contracts';
 import type { AIHistoryItem, PromptTemplate } from './aiPrompts';
+import type { AppearanceSettings } from './timeline';
 
 export const aiService = {
   getSettings: () => invoke<AiSettings>('get_ai_settings'),
@@ -14,6 +15,8 @@ export const aiService = {
   deleteCredential: (provider: string) =>
     invoke<void>('ai_delete_credential', { provider }),
   testConnection: () => invoke<void>('ai_test_connection'),
+  listOllamaModels: (endpoint: string) =>
+    invoke<string[]>('ai_list_ollama_models', { endpoint }),
   chat: (request: AiChatRequest) => invoke<AiChatResponse>('ai_chat', { request }),
   getLocalData: () => invoke<AiLocalData>('ai_get_local_data'),
   saveTemplates: (templates: PromptTemplate[]) =>
@@ -21,4 +24,7 @@ export const aiService = {
   recordInteraction: (item: AIHistoryItem) =>
     invoke<void>('ai_record_interaction', { item }),
   clearHistory: () => invoke<void>('ai_clear_history'),
+  getAppearanceSettings: () => invoke<AppearanceSettings>('get_appearance_settings'),
+  saveAppearanceSettings: (settings: AppearanceSettings) =>
+    invoke<void>('save_appearance_settings', { settings }),
 };

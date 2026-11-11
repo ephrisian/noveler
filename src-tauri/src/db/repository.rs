@@ -92,6 +92,56 @@ pub struct CodexEntryDetail {
     pub manuscript_links: Vec<CodexManuscriptLink>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEvent {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub date_label: String,
+    pub sort_order: f64,
+    pub description: String,
+    pub confidence: String,
+    pub source_scene_id: Option<String>,
+    pub dismissed: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEventInput {
+    pub project_id: String,
+    pub title: String,
+    pub date_label: String,
+    pub sort_order: f64,
+    pub description: String,
+    pub confidence: String,
+    pub source_scene_id: Option<String>,
+    pub dismissed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManuscriptImport {
+    pub title: String,
+    pub chapters: Vec<ManuscriptImportChapter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManuscriptImportChapter {
+    pub title: String,
+    pub scenes: Vec<ManuscriptImportScene>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManuscriptImportScene {
+    pub title: String,
+    pub content: String,
+}
+
 fn now() -> AppResult<String> {
     OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -219,6 +269,140 @@ pub fn list_codex_entries(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+fn timeline_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineEvent> {
+    Ok(TimelineEvent {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        date_label: row.get(3)?,
+        sort_order: row.get(4)?,
+        description: row.get(5)?,
+        confidence: row.get(6)?,
+        source_scene_id: row.get(7)?,
+        dismissed: row.get::<_, i64>(8)? != 0,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn validate_timeline_event(input: &TimelineEventInput) -> AppResult<()> {
+    validate_title(&input.title, "Timeline event")?;
+    if input.date_label.chars().count() > 120 || input.description.chars().count() > 10_000 {
+        return Err(AppError::Validation(
+            "Timeline labels or notes are too long.".into(),
+        ));
+    }
+    if !input.sort_order.is_finite() || input.sort_order.abs() > 1_000_000_000.0 {
+        return Err(AppError::Validation(
+            "Timeline ordering value is invalid.".into(),
+        ));
+    }
+    if !matches!(
+        input.confidence.as_str(),
+        "confirmed" | "inferred" | "uncertain"
+    ) {
+        return Err(AppError::Validation(
+            "Choose a valid confidence level.".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn list_timeline_events(
+    connection: &Connection,
+    project_id: &str,
+) -> AppResult<Vec<TimelineEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, title, date_label, sort_order, description, confidence, source_scene_id, dismissed, created_at, updated_at
+         FROM timeline_events WHERE project_id = ?1 ORDER BY sort_order, created_at",
+    )?;
+    let events = statement
+        .query_map([project_id], timeline_event_from_row)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::from)?;
+    Ok(events)
+}
+
+pub fn create_timeline_event(
+    connection: &mut Connection,
+    input: &TimelineEventInput,
+) -> AppResult<TimelineEvent> {
+    validate_timeline_event(input)?;
+    let transaction = connection.transaction()?;
+    let project_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        [&input.project_id],
+        |row| row.get(0),
+    )?;
+    if !project_exists {
+        return Err(AppError::NotFound("Project not found.".into()));
+    }
+    if let Some(scene_id) = &input.source_scene_id {
+        let in_project: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM scenes s JOIN chapters c ON c.id = s.chapter_id WHERE s.id = ?1 AND c.project_id = ?2)", params![scene_id, input.project_id], |row| row.get(0))?;
+        if !in_project {
+            return Err(AppError::Validation(
+                "Timeline source scene must belong to this project.".into(),
+            ));
+        }
+    }
+    let timestamp = now()?;
+    let id = new_id();
+    transaction.execute("INSERT INTO timeline_events (id, project_id, title, date_label, sort_order, description, confidence, source_scene_id, dismissed, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)", params![id, input.project_id, input.title.trim(), input.date_label.trim(), input.sort_order, input.description, input.confidence, input.source_scene_id, input.dismissed.unwrap_or(false) as i64, timestamp])?;
+    touch_project(&transaction, &input.project_id, &now()?)?;
+    transaction.commit()?;
+    connection.query_row("SELECT id, project_id, title, date_label, sort_order, description, confidence, source_scene_id, dismissed, created_at, updated_at FROM timeline_events WHERE id = ?1", [id], timeline_event_from_row).map_err(Into::into)
+}
+
+pub fn update_timeline_event(
+    connection: &mut Connection,
+    event: &TimelineEvent,
+) -> AppResult<TimelineEvent> {
+    let input = TimelineEventInput {
+        project_id: event.project_id.clone(),
+        title: event.title.clone(),
+        date_label: event.date_label.clone(),
+        sort_order: event.sort_order,
+        description: event.description.clone(),
+        confidence: event.confidence.clone(),
+        source_scene_id: event.source_scene_id.clone(),
+        dismissed: Some(event.dismissed),
+    };
+    validate_timeline_event(&input)?;
+    let transaction = connection.transaction()?;
+    if let Some(scene_id) = &event.source_scene_id {
+        let in_project: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM scenes s JOIN chapters c ON c.id = s.chapter_id WHERE s.id = ?1 AND c.project_id = ?2)", params![scene_id, event.project_id], |row| row.get(0))?;
+        if !in_project {
+            return Err(AppError::Validation(
+                "Timeline source scene must belong to this project.".into(),
+            ));
+        }
+    }
+    let timestamp = now()?;
+    let changed = transaction.execute("UPDATE timeline_events SET title = ?2, date_label = ?3, sort_order = ?4, description = ?5, confidence = ?6, source_scene_id = ?7, dismissed = ?8, updated_at = ?9 WHERE id = ?1 AND project_id = ?10", params![event.id, event.title.trim(), event.date_label.trim(), event.sort_order, event.description, event.confidence, event.source_scene_id, event.dismissed as i64, timestamp, event.project_id])?;
+    if changed == 0 {
+        return Err(AppError::NotFound("Timeline event not found.".into()));
+    }
+    touch_project(&transaction, &event.project_id, &now()?)?;
+    transaction.commit()?;
+    connection.query_row("SELECT id, project_id, title, date_label, sort_order, description, confidence, source_scene_id, dismissed, created_at, updated_at FROM timeline_events WHERE id = ?1", [event.id.as_str()], timeline_event_from_row).map_err(Into::into)
+}
+
+pub fn delete_timeline_event(connection: &mut Connection, id: &str) -> AppResult<()> {
+    let transaction = connection.transaction()?;
+    let project_id: String = transaction
+        .query_row(
+            "SELECT project_id FROM timeline_events WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("Timeline event not found.".into()))?;
+    transaction.execute("DELETE FROM timeline_events WHERE id = ?1", [id])?;
+    touch_project(&transaction, &project_id, &now()?)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub fn get_codex_entry(connection: &Connection, id: &str) -> AppResult<CodexEntry> {
     connection.query_row(
         "SELECT id, project_id, kind, title, description, tags_json, fields_json, created_at, updated_at FROM codex_entries WHERE id = ?1",
@@ -263,6 +447,66 @@ pub fn create_codex_entry(
         params![entry.id, entry.project_id, entry.kind, entry.title, entry.description, serde_json::to_string(&entry.tags)?, serde_json::to_string(&entry.fields)?, timestamp, timestamp],
     )?;
     touch_project(&transaction, project_id, &timestamp)?;
+    transaction.commit()?;
+    Ok(entry)
+}
+
+pub fn create_codex_entry_with_sources(
+    connection: &mut Connection,
+    project_id: &str,
+    kind: &str,
+    title: &str,
+    description: &str,
+    tags: &[String],
+    fields: &Value,
+    scene_ids: &[String],
+) -> AppResult<CodexEntry> {
+    validate_codex_input(kind, title, tags, fields)?;
+    if scene_ids.len() > 200
+        || scene_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != scene_ids.len()
+    {
+        return Err(AppError::Validation(
+            "Codex source scene list is invalid.".into(),
+        ));
+    }
+    let timestamp = now()?;
+    let entry = CodexEntry {
+        id: new_id(),
+        project_id: project_id.to_owned(),
+        kind: kind.trim().to_owned(),
+        title: title.trim().to_owned(),
+        description: description.to_owned(),
+        tags: tags.iter().map(|tag| tag.trim().to_owned()).collect(),
+        fields: fields.clone(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    let transaction = connection.transaction()?;
+    let project_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        [project_id],
+        |row| row.get(0),
+    )?;
+    if !project_exists {
+        return Err(AppError::NotFound("Project not found.".into()));
+    }
+    for scene_id in scene_ids {
+        let belongs: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM scenes s JOIN chapters c ON c.id = s.chapter_id WHERE s.id = ?1 AND c.project_id = ?2)", params![scene_id, project_id], |row| row.get(0))?;
+        if !belongs {
+            return Err(AppError::Validation(
+                "Codex source scenes must belong to this project.".into(),
+            ));
+        }
+    }
+    transaction.execute("INSERT INTO codex_entries (id, project_id, kind, title, description, tags_json, fields_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![entry.id, entry.project_id, entry.kind, entry.title, entry.description, serde_json::to_string(&entry.tags)?, serde_json::to_string(&entry.fields)?, timestamp, timestamp])?;
+    for scene_id in scene_ids {
+        transaction.execute("INSERT INTO codex_manuscript_links (entry_id, chapter_id, scene_id, created_at) VALUES (?1, NULL, ?2, ?3)", params![entry.id, scene_id, timestamp])?;
+    }
+    touch_project(&transaction, project_id, &now()?)?;
     transaction.commit()?;
     Ok(entry)
 }
@@ -507,6 +751,59 @@ pub fn create_project(connection: &Connection, title: &str) -> AppResult<Project
             project.updated_at
         ],
     )?;
+    Ok(project)
+}
+
+pub fn import_manuscript(
+    connection: &mut Connection,
+    input: &ManuscriptImport,
+) -> AppResult<Project> {
+    validate_title(&input.title, "Project")?;
+    if input.chapters.len() > 2_000
+        || input
+            .chapters
+            .iter()
+            .map(|chapter| chapter.scenes.len())
+            .sum::<usize>()
+            > 20_000
+    {
+        return Err(AppError::Validation(
+            "The manuscript has too many chapters or scenes to import.".into(),
+        ));
+    }
+    if input.chapters.iter().any(|chapter| {
+        chapter.title.trim().is_empty()
+            || chapter.title.chars().count() > 200
+            || chapter.scenes.iter().any(|scene| {
+                scene.title.trim().is_empty()
+                    || scene.title.chars().count() > 200
+                    || scene.content.len() > 5_000_000
+            })
+    }) {
+        return Err(AppError::Validation(
+            "Imported chapter or scene data is invalid or too large.".into(),
+        ));
+    }
+    let timestamp = now()?;
+    let project = Project {
+        id: new_id(),
+        title: input.title.trim().to_owned(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO projects (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+        params![project.id, project.title, timestamp, timestamp],
+    )?;
+    for (chapter_index, source_chapter) in input.chapters.iter().enumerate() {
+        let chapter_id = new_id();
+        transaction.execute("INSERT INTO chapters (id, project_id, title, position, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)", params![chapter_id, project.id, source_chapter.title.trim(), chapter_index as i64, timestamp])?;
+        for (scene_index, source_scene) in source_chapter.scenes.iter().enumerate() {
+            transaction.execute("INSERT INTO scenes (id, chapter_id, title, content, position, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)", params![new_id(), chapter_id, source_scene.title.trim(), source_scene.content, scene_index as i64, timestamp])?;
+        }
+    }
+    transaction.commit()?;
     Ok(project)
 }
 
@@ -867,9 +1164,8 @@ pub fn update_chapter_scene_contents(
     }
 
     let existing_ids: Vec<String> = {
-        let mut statement = connection.prepare(
-            "SELECT id FROM scenes WHERE chapter_id = ?1 ORDER BY position",
-        )?;
+        let mut statement =
+            connection.prepare("SELECT id FROM scenes WHERE chapter_id = ?1 ORDER BY position")?;
         let rows = statement.query_map([chapter_id], |row| row.get(0))?;
         rows.collect::<Result<_, _>>()?
     };

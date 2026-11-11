@@ -43,6 +43,16 @@ reproduce the reference product's branding, copy, assets, or interface.
 - Rich-text writing/editing with autosave, word counts, and focus mode.
 - A project Codex for characters, places, objects, and other story notes;
   searchable and linkable to related entries and manuscript locations.
+- Explicit AI-assisted Codex extraction from a writer-selected scene or chapter,
+  with exact-text review before sending, structured suggestions, evidence/source
+  links, duplicate awareness, and writer acceptance before any persistence.
+- User-created writing themes with validated color and typography settings,
+  Rust app-data persistence, licensed local fonts, theme preview and validated
+  theme import/export.
+- Manual project timeline events with ordering, date labels, confidence, source
+  scene links, and dismiss/restore state.
+- Markdown, plain-text, and DOCX manuscript import with a preview before
+  creating a new project; Markdown, plain-text, and DOCX export.
 - User-initiated AI tasks such as continuing a passage, brainstorming,
   rewriting selected text, improving clarity, checking continuity against
   selected Codex entries, summarizing, and giving editorial feedback.
@@ -52,8 +62,11 @@ reproduce the reference product's branding, copy, assets, or interface.
   secure credential store and requests made by the Rust backend.
 - Preview and explicit user action before AI output is inserted or replaces
   selected manuscript text.
-- Local search, Markdown/plain-text export, and versioned project backup/restore
+- Local search and versioned project backup/restore
   as the project matures.
+- DOCX and PDF/EPUB publishing, Scrivener import, and PDF manuscript import are
+  deferred and are not current release blockers; prioritize evidence-backed
+  Codex creation and review quality.
 - Linux, Windows, and macOS support, subject to platform-specific packaging and
   credential-store constraints.
 
@@ -63,8 +76,9 @@ reproduce the reference product's branding, copy, assets, or interface.
 - Collaboration, public sharing, and beta-reader workflows.
 - Automatic/background AI analysis or sending manuscript content without an
   explicit user action.
-- Automated extraction or authoritative tracking of story facts. The Codex is
-  user-maintained; AI may assist only when invoked and with selected context.
+- Background/continuous extraction or authoritative tracking of story facts.
+  AI-assisted extraction is only available after explicit scope selection and
+  review, and suggestions are not saved until accepted.
 - Silent or automatic changes to manuscript text.
 
 ## Primary user workflows
@@ -117,6 +131,14 @@ where relevant. Database changes must use versioned migrations.
   progress/error state, and response preview with explicit disposition actions.
 - **Settings:** provider/model/endpoint configuration, secure credential setup
   and connection test, prompt templates, and appearance/accessibility options.
+- **Writing theme editor:** create/edit/duplicate/delete local themes, preview
+  manuscript typography and colors, and import/export validated theme files.
+- **Codex suggestion review:** inspect the exact text to be sent, review and
+  edit extracted candidate entries and evidence, and explicitly accept/skip.
+- **Timeline:** order manually maintained story events, link source scenes, and
+  dismiss/restored events without background extraction.
+- **Manuscript import:** preview Markdown/plain-text/DOCX structure before
+  creating a new local project.
 - **Prompt-template management:** create, edit, duplicate, and delete templates;
   manage locally retained interaction metadata and clear it.
 - **Search and export/backup flows:** results that navigate to their source and
@@ -125,45 +147,45 @@ where relevant. Database changes must use versioned migrations.
 ## MVP acceptance criteria
 
 1. The app launches as a desktop application on supported development platforms
-  into a usable, accessible shell with Library, Codex, and Settings navigation,
-  a useful first-run/empty-project state, and clear local-first data behavior.
+   into a usable, accessible shell with Library, Codex, and Settings navigation,
+   a useful first-run/empty-project state, and clear local-first data behavior.
 2. A user can create, open, rename, and delete projects; deletion explains its
    effect and requires confirmation.
 3. A user can create, rename, reorder, and delete chapters/scenes, with
-  confirmation for destructive actions. Changes persist across application
-  restarts, and database failures produce useful user-facing errors.
+   confirmation for destructive actions. Changes persist across application
+   restarts, and database failures produce useful user-facing errors.
 4. Manuscript editing preserves supported formatting, supports undo/redo and
-  keyboard use, autosaves with visible saving/saved/error states, and does not
-  lose unsaved work when changing scenes.
+   keyboard use, autosaves with visible saving/saved/error states, and does not
+   lose unsaved work when changing scenes.
 5. The editor reports current-scene word count (and chapter/project counts
-  where practical) and provides a focus mode that retains essential
-  navigation and save/error status. Projects with no chapters/scenes have a
-  useful empty state.
+   where practical) and provides a focus mode that retains essential
+   navigation and save/error status. Projects with no chapters/scenes have a
+   useful empty state.
 6. Users can create, edit, search/filter, and delete character, location, item,
-  and general Codex entries with title, content, tags, and optional structured
-  fields. They can link entries to each other and, where practical, manuscript
-  locations. Destructive actions require confirmation and Codex data remains
-  associated with the local project.
+   and general Codex entries with title, content, tags, and optional structured
+   fields. They can link entries to each other and, where practical, manuscript
+   locations. Destructive actions require confirmation and Codex data remains
+   associated with the local project.
 7. Search covers project titles, manuscript text, and Codex entries and links
-  results to their source locations. Markdown and plain-text exports preserve
-  chapter/scene order; versioned backups are validated on restore, malformed
-  or unsupported backups are handled safely, and replacing existing data
-  requires clear confirmation.
+   results to their source locations. Markdown and plain-text exports preserve
+   chapter/scene order; versioned backups are validated on restore, malformed
+   or unsupported backups are handled safely, and replacing existing data
+   requires clear confirmation.
 8. At least one provider and an OpenAI-compatible endpoint option are
-  configurable. Credentials never enter frontend storage, SQLite, logs,
-  crash reports, or source code. Requests are sent only after an explicit user
-  action to the configured provider; invalid credentials, rate limits, network
-  and provider errors, and cancellation/progress have clear handling.
+   configurable. Credentials never enter frontend storage, SQLite, logs,
+   crash reports, or source code. Requests are sent only after an explicit user
+   action to the configured provider; invalid credentials, rate limits, network
+   and provider errors, and cancellation/progress have clear handling.
 9. Users can configure provider/model/endpoint, test the connection, and manage
-  prompt templates. Before sending, they can inspect and adjust the assembled
-  prompt and included context. Results are previewed and may be inserted,
-  replace selected text, copied, or discarded only by explicit user choice.
+   prompt templates. Before sending, they can inspect and adjust the assembled
+   prompt and included context. Results are previewed and may be inserted,
+   replace selected text, copied, or discarded only by explicit user choice.
 10. Full provider responses are not saved by default; any retained interaction
-   metadata is local and clearable. The app makes external data transmission
-   clear and does not issue automatic/background AI requests.
+    metadata is local and clearable. The app makes external data transmission
+    clear and does not issue automatic/background AI requests.
 11. Automated tests cover migrations and CRUD, editor persistence, Codex search
-   and links, prompt/context assembly, safe AI output handling, export order,
-   and backup/restore validation.
+    and links, prompt/context assembly, safe AI output handling, export order,
+    and backup/restore validation.
 12. Setup and development instructions document prerequisites, formatting,
     linting, type-checking, tests, and platform-specific limitations. Claims of
     successful checks/builds match checks actually run. Keyboard navigation,

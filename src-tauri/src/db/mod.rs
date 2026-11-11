@@ -63,7 +63,7 @@ impl Database {
 
 fn migrate(connection: &Connection) -> AppResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 2 {
+    if version > 3 {
         return Err(AppError::Internal(format!(
 			"This project database uses a newer schema version ({version}). Update Noveler before opening it."
 		)));
@@ -80,6 +80,14 @@ fn migrate(connection: &Connection) -> AppResult<()> {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(include_str!("../../migrations/002_codex.sql"))?;
         transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+    }
+    let current_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current_version < 3 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(include_str!("../../migrations/003_timeline.sql"))?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
     }
     Ok(())
@@ -100,7 +108,7 @@ mod tests {
                     connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 let foreign_keys: i64 =
                     connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-                assert_eq!(version, 2);
+                assert_eq!(version, 3);
                 assert_eq!(foreign_keys, 1);
                 Ok(())
             })
@@ -261,6 +269,183 @@ mod tests {
                 let project = create_project(connection, "Valid")?;
                 create_chapter(connection, &project.id, "One")?;
                 assert!(reorder_chapters(connection, &project.id, &[]).is_err());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn timeline_events_are_ordered_project_scoped_and_link_to_scenes() {
+        use repository::TimelineEventInput;
+        let database = Database::in_memory().unwrap();
+        database
+            .with_connection(|connection| {
+                let project = create_project(connection, "Timeline")?;
+                let other_project = create_project(connection, "Other timeline")?;
+                let mut connection = connection;
+                let chapter = create_chapter(&mut connection, &project.id, "Chapter")?;
+                let scene =
+                    get_project_detail(&connection, &project.id)?.chapters[0].scenes[0].clone();
+                let event_b = repository::create_timeline_event(
+                    &mut connection,
+                    &TimelineEventInput {
+                        project_id: project.id.clone(),
+                        title: "Later event".into(),
+                        date_label: "Day 2".into(),
+                        sort_order: 2.0,
+                        description: "Second.".into(),
+                        confidence: "inferred".into(),
+                        source_scene_id: Some(scene.id.clone()),
+                        dismissed: None,
+                    },
+                )?;
+                let event_a = repository::create_timeline_event(
+                    &mut connection,
+                    &TimelineEventInput {
+                        project_id: project.id.clone(),
+                        title: "Earlier event".into(),
+                        date_label: "Day 1".into(),
+                        sort_order: 1.0,
+                        description: String::new(),
+                        confidence: "confirmed".into(),
+                        source_scene_id: None,
+                        dismissed: None,
+                    },
+                )?;
+                let ordered = repository::list_timeline_events(&connection, &project.id)?;
+                assert_eq!(
+                    ordered
+                        .iter()
+                        .map(|event| event.title.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["Earlier event", "Later event"]
+                );
+                let mut edited = event_a.clone();
+                edited.dismissed = true;
+                repository::update_timeline_event(&mut connection, &edited)?;
+                assert!(repository::list_timeline_events(&connection, &project.id)?[0].dismissed);
+                let invalid = TimelineEventInput {
+                    project_id: other_project.id,
+                    title: "Bad source".into(),
+                    date_label: String::new(),
+                    sort_order: 0.0,
+                    description: String::new(),
+                    confidence: "confirmed".into(),
+                    source_scene_id: Some(scene.id),
+                    dismissed: None,
+                };
+                assert!(repository::create_timeline_event(&mut connection, &invalid).is_err());
+                repository::delete_timeline_event(&mut connection, &event_b.id)?;
+                assert_eq!(
+                    repository::list_timeline_events(&connection, &project.id)?.len(),
+                    1
+                );
+                assert!(chapter.position >= 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn generated_codex_entry_and_source_links_commit_atomically() {
+        let database = Database::in_memory().unwrap();
+        database
+            .with_connection(|connection| {
+                let project = create_project(connection, "Generated Codex")?;
+                let other = create_project(connection, "Other project")?;
+                let mut connection = connection;
+                let chapter = create_chapter(&mut connection, &project.id, "Chapter")?;
+                let scene =
+                    get_project_detail(&connection, &project.id)?.chapters[0].scenes[0].clone();
+                let fields = Value::Object(Default::default());
+                let entry = repository::create_codex_entry_with_sources(
+                    &mut connection,
+                    &project.id,
+                    "character",
+                    "Mira",
+                    "Cartographer",
+                    &[],
+                    &fields,
+                    &[scene.id.clone()],
+                )?;
+                let detail = repository::get_codex_entry_detail(&connection, &entry.id)?;
+                assert_eq!(detail.manuscript_links.len(), 1);
+                assert_eq!(
+                    detail.manuscript_links[0].scene_id.as_deref(),
+                    Some(scene.id.as_str())
+                );
+                assert!(repository::create_codex_entry_with_sources(
+                    &mut connection,
+                    &other.id,
+                    "character",
+                    "Wrong source",
+                    "",
+                    &[],
+                    &fields,
+                    &[scene.id]
+                )
+                .is_err());
+                assert_eq!(
+                    repository::list_codex_entries(&connection, &other.id, "", None)?.len(),
+                    0
+                );
+                assert!(chapter.position >= 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn manuscript_import_creates_ordered_new_project_transactionally() {
+        use repository::{ManuscriptImport, ManuscriptImportChapter, ManuscriptImportScene};
+        let database = Database::in_memory().unwrap();
+        database
+            .with_connection(|connection| {
+                let mut connection = connection;
+                let imported = repository::import_manuscript(
+                    &mut connection,
+                    &ManuscriptImport {
+                        title: "Imported novel".into(),
+                        chapters: vec![
+                            ManuscriptImportChapter {
+                                title: "One".into(),
+                                scenes: vec![ManuscriptImportScene {
+                                    title: "Opening".into(),
+                                    content: "First.".into(),
+                                }],
+                            },
+                            ManuscriptImportChapter {
+                                title: "Two".into(),
+                                scenes: vec![ManuscriptImportScene {
+                                    title: "Arrival".into(),
+                                    content: "Second.".into(),
+                                }],
+                            },
+                        ],
+                    },
+                )?;
+                let detail = get_project_detail(&connection, &imported.id)?;
+                assert_eq!(
+                    detail
+                        .chapters
+                        .iter()
+                        .map(|chapter| chapter.chapter.title.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["One", "Two"]
+                );
+                assert_eq!(detail.chapters[1].scenes[0].content, "Second.");
+                assert!(repository::import_manuscript(
+                    &mut connection,
+                    &ManuscriptImport {
+                        title: "Bad".into(),
+                        chapters: vec![ManuscriptImportChapter {
+                            title: "".into(),
+                            scenes: vec![]
+                        }]
+                    }
+                )
+                .is_err());
+                assert_eq!(list_projects(&connection)?.len(), 1);
                 Ok(())
             })
             .unwrap();

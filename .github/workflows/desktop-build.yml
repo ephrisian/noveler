@@ -1,0 +1,84 @@
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux bundles
+            os: ubuntu-22.04
+            bundles: deb,rpm,appimage
+            artifact: linux
+          - name: Windows installers
+            os: windows-latest
+            bundles: msi,nsis
+            artifact: windows
+          - name: macOS app and disk image
+            os: macos-latest
+            bundles: app,dmg
+            artifact: macos
+            rust-targets: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl file libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
+            libxdo-dev wget
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets || (runner.os == 'Windows' && 'x86_64-pc-windows-msvc' || 'x86_64-unknown-linux-gnu') }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run release checks
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test -- --reporter=dot
+          npm run build
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build native bundles
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+      - name: Build Intel macOS bundles
+        if: runner.os == 'macOS'
+        run: npm run tauri -- build --target x86_64-apple-darwin --bundles app,dmg
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+      - name: Upload unsigned bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: noveler-${{ matrix.artifact }}-${{ github.ref_name }}
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/x86_64-apple-darwin/release/bundle/**
+          if-no-files-found: error

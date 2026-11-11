@@ -35,18 +35,40 @@ import {
 import { createDebouncedAction } from '../shared/debouncedAction';
 import { codexService } from '../shared/codex';
 import { aiService } from '../shared/ai';
-import { portableService, type SearchResult } from '../shared/portable';
+import { createDocxExport, portableService, type SearchResult } from '../shared/portable';
 import type { AIHistoryItem, PromptTemplate } from '../shared/aiPrompts';
 import AiWritingPanel from './AiWritingPanel';
 import { projectService } from '../shared/projects';
+import {
+  timelineService,
+  type TimelineEvent,
+  type TimelineEventInput,
+} from '../shared/timeline';
+import {
+  buildCodexSuggestionPrompt,
+  parseCodexSuggestions,
+  type CodexSuggestion,
+} from '../shared/codexSuggestions';
+import {
+  DEFAULT_WRITING_THEMES,
+  contrastRatio,
+  loadWritingThemes,
+  exportWritingTheme,
+  parseWritingThemeImport,
+  saveWritingThemes,
+  validateWritingTheme,
+  WRITING_FONTS,
+  type WritingTheme,
+} from '../shared/themes';
 
-type Page = 'Library' | 'Codex' | 'Settings';
+type Page = 'Library' | 'Codex' | 'Timeline' | 'Settings';
 type Theme = 'light' | 'dark';
 type TextScale = '1' | '1.15' | '1.3';
 
 const navigation: { name: Page; icon: typeof Library }[] = [
   { name: 'Library', icon: Library },
   { name: 'Codex', icon: BookOpenText },
+  { name: 'Timeline', icon: BookOpenText },
   { name: 'Settings', icon: Settings2 },
 ];
 
@@ -66,11 +88,28 @@ function App() {
       return '1';
     }
   });
+  const [writingThemes, setWritingThemes] = useState<WritingTheme[]>(loadWritingThemes);
+  const [writingThemeId, setWritingThemeId] = useState(() => {
+    try {
+      const id = localStorage.getItem('noveler-writing-theme-id');
+      return writingThemes.some((theme) => theme.id === id)
+        ? id!
+        : DEFAULT_WRITING_THEMES[0].id;
+    } catch {
+      return DEFAULT_WRITING_THEMES[0].id;
+    }
+  });
   const [page, setPage] = useState<Page>('Library');
   const [projects, setProjects] = useState<Project[]>([]);
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
   const [sceneText, setSceneText] = useState('');
+  const [chapterEditId, setChapterEditId] = useState<string | null>(null);
+  const [chapterContents, setChapterContents] = useState<Record<string, string>>({});
+  const [restoreError, setRestoreError] = useState('');
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const aiTriggerRef = useRef<HTMLButtonElement>(null);
+  const [selection, setSelection] = useState({ start: 0, end: 0, text: '' });
   const [chapterSceneSaveStates, setChapterSceneSaveStates] = useState<
     Record<string, 'saving' | 'saved' | 'error'>
   >({});
@@ -91,6 +130,12 @@ function App() {
   const [codexKind, setCodexKind] = useState('');
   const [codexProjectId, setCodexProjectId] = useState('');
   const [codexError, setCodexError] = useState('');
+  const [timelineEvents, setTimelineEvents] = useState<TimelineEvent[]>([]);
+  const [timelineError, setTimelineError] = useState('');
+  const [timelineProjectId, setTimelineProjectId] = useState('');
+  const [appearanceLoaded, setAppearanceLoaded] = useState(false);
+  const [appearanceMigrationComplete, setAppearanceMigrationComplete] = useState(false);
+  const [appearanceSettingsReady, setAppearanceSettingsReady] = useState(false);
   const [aiLocalData, setAiLocalData] = useState<{
     templates: PromptTemplate[];
     history: AIHistoryItem[];
@@ -100,6 +145,11 @@ function App() {
   const [searchError, setSearchError] = useState('');
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [importPreview, setImportPreview] = useState<
+    import('../shared/portable').ManuscriptImport | null
+  >(null);
+  const [importFilename, setImportFilename] = useState('');
+  const [importError, setImportError] = useState('');
   const [activeSearchResult, setActiveSearchResult] = useState(0);
   const [pendingWindowClose, setPendingWindowClose] = useState(false);
   const [closingAfterSave, setClosingAfterSave] = useState(false);
@@ -109,6 +159,8 @@ function App() {
   const saveStateRef = useRef(saveState);
   const selectedSceneRef = useRef(selectedScene);
   const pageRef = useRef(page);
+  const activeWritingTheme =
+    writingThemes.find((item) => item.id === writingThemeId) ?? writingThemes[0];
   saveStateRef.current = saveState;
   selectedSceneRef.current = selectedScene;
   pageRef.current = page;
@@ -130,6 +182,123 @@ function App() {
       // Keep the selected scale for this session if local storage is unavailable.
     }
   }, [textScale]);
+
+  useEffect(() => {
+    if (!activeWritingTheme) return;
+    const root = document.documentElement;
+    root.style.setProperty('--writer-background', activeWritingTheme.background);
+    root.style.setProperty('--writer-foreground', activeWritingTheme.foreground);
+    root.style.setProperty('--writer-font', activeWritingTheme.fontFamily);
+    root.style.setProperty(
+      '--writer-heading-font',
+      activeWritingTheme.headingFontFamily ?? activeWritingTheme.fontFamily,
+    );
+    root.style.setProperty('--writer-font-size', `${activeWritingTheme.fontSize}px`);
+    root.style.setProperty('--writer-line-height', String(activeWritingTheme.lineHeight));
+    root.style.setProperty(
+      '--writer-content-width',
+      `${activeWritingTheme.contentWidth}px`,
+    );
+    root.dataset.sceneDivider = activeWritingTheme.sceneDivider ?? 'line';
+  }, [activeWritingTheme]);
+
+  useEffect(() => {
+    let active = true;
+    void aiService
+      .getAppearanceSettings()
+      .then((settings) => {
+        if (!active) return;
+        if (settings.theme === 'light' || settings.theme === 'dark')
+          setTheme(settings.theme);
+        if (
+          settings.textScale === '1' ||
+          settings.textScale === '1.15' ||
+          settings.textScale === '1.3'
+        )
+          setTextScale(settings.textScale);
+        setAppearanceSettingsReady(true);
+        if (
+          settings.version === 1 &&
+          Array.isArray(settings.themes) &&
+          settings.themes.length > 0 &&
+          settings.themes.every(validateWritingTheme)
+        ) {
+          setWritingThemes(settings.themes as WritingTheme[]);
+          if (
+            settings.themes.some(
+              (item) => (item as WritingTheme).id === settings.selectedThemeId,
+            )
+          )
+            setWritingThemeId(settings.selectedThemeId);
+          setAppearanceMigrationComplete(true);
+        } else {
+          try {
+            const legacy = localStorage.getItem('noveler-writing-themes');
+            const parsed: unknown = legacy ? JSON.parse(legacy) : null;
+            if (
+              Array.isArray(parsed) &&
+              parsed.length > 0 &&
+              parsed.every(validateWritingTheme)
+            )
+              setWritingThemes(parsed);
+            const legacyId = localStorage.getItem('noveler-writing-theme-id');
+            if (
+              legacyId &&
+              Array.isArray(parsed) &&
+              parsed.some((item) => item.id === legacyId)
+            )
+              setWritingThemeId(legacyId);
+          } catch {
+            /* Use built-in themes when legacy browser settings are invalid. */
+          }
+          setAppearanceMigrationComplete(true);
+        }
+      })
+      .catch(() => {
+        // Keep built-in and legacy local preferences if the settings file is unavailable.
+        if (active) setAppearanceSettingsReady(false);
+      })
+      .finally(() => {
+        if (active) {
+          setAppearanceMigrationComplete(true);
+          setAppearanceLoaded(true);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!appearanceLoaded || !appearanceMigrationComplete || !appearanceSettingsReady)
+      return;
+    const settings = {
+      version: 1 as const,
+      themes: writingThemes,
+      selectedThemeId: writingThemeId,
+      theme,
+      textScale,
+    };
+    void aiService
+      .saveAppearanceSettings(settings)
+      .then(() => {
+        try {
+          saveWritingThemes(writingThemes);
+          localStorage.setItem('noveler-writing-theme-id', writingThemeId);
+        } catch {
+          /* Native settings remain authoritative when browser storage is blocked. */
+        }
+      })
+      .catch((cause) => setError(errorMessage(cause)));
+  }, [
+    appearanceLoaded,
+    appearanceMigrationComplete,
+    appearanceSettingsReady,
+    writingThemes,
+    writingThemeId,
+    theme,
+    textScale,
+  ]);
 
   useEffect(() => {
     setActiveSearchResult(0);
@@ -251,21 +420,24 @@ function App() {
     }
   }, []);
 
-  const scheduleChapterSceneSave = useCallback((sceneId: string, content: string) => {
-    const revision = (chapterSceneRevisions.current.get(sceneId) ?? 0) + 1;
-    chapterSceneRevisions.current.set(sceneId, revision);
-    chapterSceneDrafts.current.set(sceneId, { content, revision });
-    setChapterSceneSaveStates((current) => ({ ...current, [sceneId]: 'saving' }));
-    const timer = chapterSceneTimers.current.get(sceneId);
-    if (timer) window.clearTimeout(timer);
-    chapterSceneTimers.current.set(
-      sceneId,
-      window.setTimeout(() => {
-        chapterSceneTimers.current.delete(sceneId);
-        void saveChapterSceneDraft(sceneId);
-      }, 700),
-    );
-  }, [saveChapterSceneDraft]);
+  const scheduleChapterSceneSave = useCallback(
+    (sceneId: string, content: string) => {
+      const revision = (chapterSceneRevisions.current.get(sceneId) ?? 0) + 1;
+      chapterSceneRevisions.current.set(sceneId, revision);
+      chapterSceneDrafts.current.set(sceneId, { content, revision });
+      setChapterSceneSaveStates((current) => ({ ...current, [sceneId]: 'saving' }));
+      const timer = chapterSceneTimers.current.get(sceneId);
+      if (timer) window.clearTimeout(timer);
+      chapterSceneTimers.current.set(
+        sceneId,
+        setTimeout(() => {
+          chapterSceneTimers.current.delete(sceneId);
+          void saveChapterSceneDraft(sceneId);
+        }, 700),
+      );
+    },
+    [saveChapterSceneDraft],
+  );
 
   const flushChapterSceneDrafts = useCallback(async () => {
     for (const timer of chapterSceneTimers.current.values()) window.clearTimeout(timer);
@@ -275,10 +447,13 @@ function App() {
     return sceneIds.every((sceneId) => !chapterSceneDrafts.current.has(sceneId));
   }, [saveChapterSceneDraft]);
 
-  useEffect(() => () => {
-    for (const timer of chapterSceneTimers.current.values()) window.clearTimeout(timer);
-    chapterSceneTimers.current.clear();
-  }, []);
+  useEffect(
+    () => () => {
+      for (const timer of chapterSceneTimers.current.values()) window.clearTimeout(timer);
+      chapterSceneTimers.current.clear();
+    },
+    [],
+  );
 
   const refreshProjects = async () => {
     setError('');
@@ -380,8 +555,10 @@ function App() {
     }
   };
 
-  const downloadFile = (filename: string, content: string, type: string) => {
-    const url = URL.createObjectURL(new Blob([content], { type }));
+  const downloadFile = (filename: string, content: string | Blob, type: string) => {
+    const url = URL.createObjectURL(
+      content instanceof Blob ? content : new Blob([content], { type }),
+    );
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = filename;
@@ -442,6 +619,26 @@ function App() {
 
   const activeCodexProjectId =
     project?.project.id ?? (codexProjectId || projects[0]?.id || '');
+  const activeTimelineProjectId =
+    timelineProjectId || project?.project.id || projects[0]?.id || '';
+
+  const refreshTimeline = async (projectId: string) => {
+    if (!projectId) {
+      setTimelineEvents([]);
+      return;
+    }
+    setTimelineError('');
+    try {
+      setTimelineEvents(await timelineService.list(projectId));
+    } catch (cause) {
+      setTimelineError(errorMessage(cause));
+    }
+  };
+
+  useEffect(() => {
+    if (page === 'Timeline' && activeTimelineProjectId)
+      void refreshTimeline(activeTimelineProjectId);
+  }, [page, activeTimelineProjectId]);
 
   const refreshCodex = useCallback(
     async (projectId: string, query = codexQuery, kind = codexKind) => {
@@ -565,7 +762,7 @@ function App() {
 
   const navigate = async (destination: Page) => {
     if (destination === pageRef.current) return;
-    if (!(await flushChapterSceneDrafts())) return;
+    if (chapterSceneDrafts.current.size > 0 && !(await flushChapterSceneDrafts())) return;
     if (selectedScene && ['unsaved', 'saving', 'error'].includes(saveState)) {
       await autosave.current.flush();
       if (saveStateRef.current === 'error') return;
@@ -576,8 +773,9 @@ function App() {
   useEffect(() => {
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
       if (
-        (!selectedSceneRef.current || !['unsaved', 'saving', 'error'].includes(saveStateRef.current))
-        && chapterSceneDrafts.current.size === 0
+        (!selectedSceneRef.current ||
+          !['unsaved', 'saving', 'error'].includes(saveStateRef.current)) &&
+        chapterSceneDrafts.current.size === 0
       )
         return;
       event.preventDefault();
@@ -601,7 +799,7 @@ function App() {
       window.removeEventListener('beforeunload', onBeforeUnload);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, []);
+  }, [flushChapterSceneDrafts]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -610,12 +808,24 @@ function App() {
     void getCurrentWindow()
       .onCloseRequested((event) => {
         if (allowWindowClose.current) return;
-        if (
-          !selectedSceneRef.current ||
-          (!['unsaved', 'saving', 'error'].includes(saveStateRef.current)
-            && chapterSceneDrafts.current.size === 0)
-        )
+        const hasUnsavedScene = Boolean(
+          selectedSceneRef.current &&
+          ['unsaved', 'saving', 'error'].includes(saveStateRef.current),
+        );
+        const hasChapterDrafts = chapterSceneDrafts.current.size > 0;
+        if (!hasUnsavedScene && !hasChapterDrafts) {
+          // Explicitly resume the native close after canceling the current request.
+          // This also handles desktop Exit actions that invoke Tauri's close command.
+          event.preventDefault();
+          allowWindowClose.current = true;
+          void getCurrentWindow()
+            .close()
+            .catch((cause) => {
+              allowWindowClose.current = false;
+              setError(errorMessage(cause));
+            });
           return;
+        }
         event.preventDefault();
         setPendingWindowClose(true);
       })
@@ -635,7 +845,7 @@ function App() {
     if (!(await flushChapterSceneDrafts())) return;
     if (!selectedSceneRef.current) {
       allowWindowClose.current = true;
-      await getCurrentWindow().destroy();
+      await getCurrentWindow().close();
       return;
     }
     setClosingAfterSave(true);
@@ -644,7 +854,7 @@ function App() {
     if (!saved) return;
     setPendingWindowClose(false);
     allowWindowClose.current = true;
-    await getCurrentWindow().destroy();
+    await getCurrentWindow().close();
   };
 
   const discardDraftAndClose = async () => {
@@ -654,7 +864,7 @@ function App() {
     chapterSceneDrafts.current.clear();
     setPendingWindowClose(false);
     allowWindowClose.current = true;
-    await getCurrentWindow().destroy();
+    await getCurrentWindow().close();
   };
 
   const closeProject = () => {
@@ -883,6 +1093,33 @@ function App() {
             >
               Restore as new project
             </button>
+            <button
+              className="secondary-button"
+              onClick={() => document.getElementById('manuscript-import-input')?.click()}
+              type="button"
+            >
+              Import manuscript
+            </button>
+            <input
+              id="manuscript-import-input"
+              aria-label="Choose manuscript to import"
+              type="file"
+              accept=".md,.markdown,.txt,.docx,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = '';
+                if (!file) return;
+                setImportError('');
+                void portableService
+                  .parseManuscriptFile(file)
+                  .then((preview) => {
+                    setImportPreview(preview);
+                    setImportFilename(file.name);
+                  })
+                  .catch((cause) => setImportError(errorMessage(cause)));
+              }}
+            />
             <input
               accept="application/json,.json"
               aria-label="Choose backup to restore as a new project"
@@ -978,6 +1215,61 @@ function App() {
             {error}
           </div>
         )}
+        {importError && (
+          <p className="form-error" role="alert">
+            {importError}
+          </p>
+        )}
+        {importPreview && (
+          <section
+            className="codex-suggestion-review"
+            aria-label="Manuscript import preview"
+          >
+            <h2>Import preview · {importFilename}</h2>
+            <p>
+              <strong>{importPreview.title}</strong> · {importPreview.chapters.length}{' '}
+              chapters ·{' '}
+              {importPreview.chapters.reduce(
+                (total, chapter) => total + chapter.scenes.length,
+                0,
+              )}{' '}
+              scenes
+            </p>
+            <ol>
+              {importPreview.chapters.map((chapter, index) => (
+                <li key={`${chapter.title}-${index}`}>
+                  {chapter.title} · {chapter.scenes.length} scenes
+                </li>
+              ))}
+            </ol>
+            <div className="heading-actions">
+              <button
+                className="primary-button"
+                onClick={() =>
+                  void portableService
+                    .importManuscript(importPreview)
+                    .then(async (created) => {
+                      setImportPreview(null);
+                      await refreshProjects();
+                      setProject(await projectService.openProject(created.id));
+                      setPage('Library');
+                    })
+                    .catch((cause) => setImportError(errorMessage(cause)))
+                }
+                type="button"
+              >
+                Create project from import
+              </button>
+              <button
+                className="text-button"
+                onClick={() => setImportPreview(null)}
+                type="button"
+              >
+                Cancel import
+              </button>
+            </div>
+          </section>
+        )}
         {pendingWindowClose && (
           <div className="close-confirm-backdrop">
             <section
@@ -1028,13 +1320,85 @@ function App() {
               project={project}
               selectedScene={selectedScene}
               sceneText={sceneText}
+              chapterEditId={chapterEditId}
+              setChapterEditId={setChapterEditId}
+              chapterContents={chapterContents}
+              setChapterContents={setChapterContents}
+              restoreError={restoreError}
+              setRestoreError={setRestoreError}
+              aiPanelOpen={aiPanelOpen}
+              setAiPanelOpen={setAiPanelOpen}
+              aiTriggerRef={aiTriggerRef}
+              selection={selection}
+              setSelection={setSelection}
               codexEntries={codexEntries}
+              onCheckCodexDuplicate={async (suggestion) => {
+                const entries = await codexService.list(project.project.id, '', null);
+                setCodexEntries(entries);
+                const duplicate =
+                  entries.find(
+                    (entry) =>
+                      entry.kind === suggestion.kind &&
+                      entry.title.trim().toLocaleLowerCase() ===
+                        suggestion.title.trim().toLocaleLowerCase(),
+                  ) ?? null;
+                return duplicate;
+              }}
               selectedCodex={selectedCodex}
               projectTemplates={aiLocalData.templates}
               aiHistory={aiLocalData.history}
               onSaveTemplates={async (templates) => {
                 await aiService.saveTemplates(templates);
                 setAiLocalData((current) => ({ ...current, templates }));
+              }}
+              writingTheme={activeWritingTheme}
+              onGenerateCodex={async (text, sourceSceneIds, sourceLabel) => {
+                if (!text.trim())
+                  throw new Error(
+                    'There is no manuscript text in this selection to analyze.',
+                  );
+                if (text.length > 100_000)
+                  throw new Error(
+                    'Analysis text is limited to 100,000 characters. Select a smaller scope.',
+                  );
+                const result = await aiService.chat({
+                  messages: [
+                    {
+                      role: 'user',
+                      content: buildCodexSuggestionPrompt(text, sourceLabel),
+                    },
+                  ],
+                  maxTokens: 2000,
+                });
+                const sourceText = text.toLocaleLowerCase();
+                const normalizeEvidence = (value: string) =>
+                  value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+                const suggestions = parseCodexSuggestions(result.text, sourceSceneIds);
+                const acceptedEvidence = suggestions.filter((suggestion) => {
+                  const evidence = suggestion.evidence.trim();
+                  return (
+                    evidence.length > 0 &&
+                    normalizeEvidence(sourceText).includes(normalizeEvidence(evidence))
+                  );
+                });
+                return acceptedEvidence;
+              }}
+              onAcceptCodexSuggestion={async (suggestion, allowDuplicate) => {
+                if (!project) return false;
+                if (suggestion.duplicateTitle && !allowDuplicate) return false;
+                await codexService.createWithSources(
+                  {
+                    projectId: project.project.id,
+                    kind: suggestion.kind,
+                    title: suggestion.title,
+                    description: suggestion.description,
+                    tags: suggestion.tags,
+                    fields: suggestion.fields,
+                  },
+                  suggestion.sceneIds,
+                );
+                await refreshCodex(project.project.id);
+                return true;
               }}
               onTemplateHistory={async (item) => {
                 await aiService.recordInteraction(item);
@@ -1050,9 +1414,22 @@ function App() {
               onExport={async (format) => {
                 try {
                   if (!(await flushDraftBeforePortableAction())) return;
+                  if (format === 'docx') {
+                    const markdown = await portableService.exportManuscript(
+                      project.project.id,
+                      'markdown',
+                    );
+                    const blob = await createDocxExport(project.project.title, markdown);
+                    downloadFile(
+                      `${safeFilename(project.project.title)}.docx`,
+                      blob,
+                      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    );
+                    return;
+                  }
                   const content = await portableService.exportManuscript(
                     project.project.id,
-                    format,
+                    format as 'markdown' | 'text',
                   );
                   downloadFile(
                     `${safeFilename(project.project.title)}.${format === 'markdown' ? 'md' : 'txt'}`,
@@ -1096,6 +1473,10 @@ function App() {
                 selectedScene && void persistScene(selectedScene.id, sceneTextRef.current)
               }
               onFlushSave={() => void autosave.current.flush()}
+              onSaveChapterScene={(sceneId, content) =>
+                scheduleChapterSceneSave(sceneId, content)
+              }
+              chapterSceneSaveStates={chapterSceneSaveStates}
               onSelectScene={selectScene}
               onSelectChapter={(chapter) => {
                 setChapterEditId(chapter.chapter.id);
@@ -1247,10 +1628,57 @@ function App() {
                 setCodexError(errorMessage(cause));
               }
             }}
-            onSaveChapterScene={(sceneId, text) =>
-              scheduleChapterSceneSave(sceneId, text)
+          />
+        )}
+        {page === 'Timeline' && (
+          <TimelinePage
+            projects={projects}
+            projectId={activeTimelineProjectId}
+            projectDetail={
+              codexProjectDetail?.project.id === activeTimelineProjectId
+                ? codexProjectDetail
+                : project?.project.id === activeTimelineProjectId
+                  ? project
+                  : null
             }
-            chapterSceneSaveStates={chapterSceneSaveStates}
+            events={timelineEvents}
+            error={timelineError}
+            onProjectChange={setTimelineProjectId}
+            onReload={() => void refreshTimeline(activeTimelineProjectId)}
+            onCreate={async (input) => {
+              const created = await timelineService.create(input);
+              setTimelineEvents((items) =>
+                [...items, created].sort((a, b) => a.sortOrder - b.sortOrder),
+              );
+            }}
+            onUpdate={async (event) => {
+              const updated = await timelineService.update(event);
+              setTimelineEvents((items) =>
+                items
+                  .map((item) => (item.id === updated.id ? updated : item))
+                  .sort((a, b) => a.sortOrder - b.sortOrder),
+              );
+            }}
+            onDelete={async (event) => {
+              await timelineService.remove(event.id);
+              setTimelineEvents((items) => items.filter((item) => item.id !== event.id));
+            }}
+            onJumpToScene={(sceneId) => {
+              const target = projects.find((item) => item.id === activeTimelineProjectId);
+              if (!target || !sceneId) return;
+              void projectService
+                .openProject(target.id)
+                .then((detail) => {
+                  setProject(detail);
+                  applySelectedScene(
+                    detail.chapters
+                      .flatMap((chapter) => chapter.scenes)
+                      .find((scene) => scene.id === sceneId) ?? null,
+                  );
+                  setPage('Library');
+                })
+                .catch((cause) => setTimelineError(errorMessage(cause)));
+            }}
           />
         )}
         {page === 'Library' &&
@@ -1274,6 +1702,10 @@ function App() {
             onThemeChange={setTheme}
             textScale={textScale}
             onTextScaleChange={setTextScale}
+            writingThemes={writingThemes}
+            selectedWritingThemeId={writingThemeId}
+            onSelectWritingTheme={setWritingThemeId}
+            onSaveWritingThemes={setWritingThemes}
           />
         )}
       </main>
@@ -1427,6 +1859,17 @@ interface ProjectWorkspaceProps {
   codexEntries: CodexEntry[];
   selectedCodex: CodexEntryDetail | null;
   projectTemplates: PromptTemplate[];
+  writingTheme: WritingTheme;
+  onGenerateCodex: (
+    text: string,
+    sourceSceneIds: string[],
+    sourceLabel: string,
+  ) => Promise<CodexSuggestion[]>;
+  onCheckCodexDuplicate: (suggestion: CodexSuggestion) => Promise<CodexEntry | null>;
+  onAcceptCodexSuggestion: (
+    suggestion: CodexSuggestion,
+    allowDuplicate?: boolean,
+  ) => Promise<boolean>;
   aiHistory: AIHistoryItem[];
   saveState: 'saved' | 'saving' | 'unsaved' | 'error';
   saveError: string;
@@ -1443,6 +1886,19 @@ interface ProjectWorkspaceProps {
   onFlushSave: () => void;
   onSaveChapterScene: (sceneId: string, content: string) => void;
   chapterSceneSaveStates: Record<string, 'saving' | 'saved' | 'error'>;
+  chapterEditId: string | null;
+  setChapterEditId: React.Dispatch<React.SetStateAction<string | null>>;
+  chapterContents: Record<string, string>;
+  setChapterContents: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  restoreError: string;
+  setRestoreError: React.Dispatch<React.SetStateAction<string>>;
+  aiPanelOpen: boolean;
+  setAiPanelOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  aiTriggerRef: React.RefObject<HTMLButtonElement | null>;
+  selection: { start: number; end: number; text: string };
+  setSelection: React.Dispatch<
+    React.SetStateAction<{ start: number; end: number; text: string }>
+  >;
   onSelectScene: (scene: Scene) => void;
   onSelectChapter: (chapter: ChapterWithScenes) => void;
   onTextChange: (text: string) => void;
@@ -1452,7 +1908,7 @@ interface ProjectWorkspaceProps {
   ) => Promise<void>;
   onTemplateHistory: (item: import('../shared/aiPrompts').AIHistoryItem) => Promise<void>;
   onClearAiHistory: () => Promise<void>;
-  onExport: (format: 'markdown' | 'text') => Promise<void>;
+  onExport: (format: 'markdown' | 'text' | 'docx') => Promise<void>;
   onBackup: () => Promise<void>;
   onRestoreFile: (file: File) => Promise<void>;
 }
@@ -1496,15 +1952,35 @@ interface CodexPageProps {
 }
 
 function ProjectWorkspace(props: ProjectWorkspaceProps) {
-  const { project, selectedScene, saveState, focusMode } = props;
-  const { onToggleFocus, onRetrySave, onFlushSave } = props;
+  const {
+    project,
+    selectedScene,
+    saveState,
+    focusMode,
+    chapterEditId,
+    setChapterEditId,
+    chapterContents,
+    setChapterContents,
+    restoreError,
+    setRestoreError,
+    aiPanelOpen,
+    setAiPanelOpen,
+    aiTriggerRef,
+    selection,
+    setSelection,
+  } = props;
+  const [codexSuggestions, setCodexSuggestions] = useState<CodexSuggestion[]>([]);
+  const [checkingDuplicateIndex, setCheckingDuplicateIndex] = useState<number | null>(
+    null,
+  );
+  const [codexSuggestionBusy, setCodexSuggestionBusy] = useState(false);
+  const [codexSuggestionError, setCodexSuggestionError] = useState('');
+  const [pendingCodexAnalysis, setPendingCodexAnalysis] = useState<{
+    text: string;
+    sceneIds: string[];
+    label: string;
+  } | null>(null);
   const { onTextChange } = props;
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
-  const [chapterEditId, setChapterEditId] = useState<string | null>(null);
-  const [chapterContents, setChapterContents] = useState<Record<string, string>>({});
-  const [restoreError, setRestoreError] = useState('');
-  const aiTriggerRef = useRef<HTMLButtonElement>(null);
-  const [selection, setSelection] = useState({ start: 0, end: 0, text: '' });
   const selectText = (textarea: HTMLTextAreaElement) => {
     const start = textarea.selectionStart;
     const end = textarea.selectionEnd;
@@ -1540,67 +2016,22 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
       ),
     0,
   );
-  const activeChapter = project.chapters.find((chapter) =>
-    chapter.scenes.some((scene) => scene.id === selectedScene?.id),
-  ) ?? null;
+  const activeChapter =
+    project.chapters.find((chapter) =>
+      chapter.scenes.some((scene) => scene.id === selectedScene?.id),
+    ) ?? null;
   const chapterDocument = Boolean(
     chapterEditId && activeChapter?.chapter.id === chapterEditId,
   );
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
-  const [chapterEditId, setChapterEditId] = useState<string | null>(null);
-  const [chapterContents, setChapterContents] = useState<Record<string, string>>({});
-  const [chapterSaveStates, setChapterSaveStates] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
-  const [chapterEditId, setChapterEditId] = useState<string | null>(null);
-  const [chapterContents, setChapterContents] = useState<Record<string, string>>({});
-  const [restoreError, setRestoreError] = useState('');
-  const aiTriggerRef = useRef<HTMLButtonElement>(null);
-  const [selection, setSelection] = useState({ start: 0, end: 0, text: '' });
-  const selectText = (textarea: HTMLTextAreaElement) => {
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    setSelection({ start, end, text: textarea.value.slice(start, end) });
-  };
-  const sceneDocument = parseStoredContent(props.sceneText);
-  const wordCount = countWords(sceneDocument);
-  const chapterWords =
-    project.chapters
-      .find((chapter) => chapter.scenes.some((scene) => scene.id === selectedScene?.id))
-      ?.scenes.reduce(
-        (total, scene) =>
-          total +
-          countWords(
-            scene.id === selectedScene?.id
-              ? sceneDocument
-              : parseStoredContent(scene.content),
-          ),
-        0,
-      ) ?? 0;
-  const projectWords = project.chapters.reduce(
-    (total, chapter) =>
-      total +
-      chapter.scenes.reduce(
-        (sum, scene) =>
-          sum +
-          countWords(
-            scene.id === selectedScene?.id
-              ? sceneDocument
-              : parseStoredContent(scene.content),
-          ),
-        0,
-      ),
-    0,
-  );
-  const activeChapter = project.chapters.find((chapter) =>
-    chapter.scenes.some((scene) => scene.id === selectedScene?.id),
-  ) ?? null;
-  const showingChapterDocument = chapterEditId === activeChapter?.chapter.id;
-  const chapterWordCount = activeChapter?.scenes.reduce((total, scene) => {
-    const text = chapterContents[scene.id]
-      ?? (scene.id === selectedScene?.id
-        ? plainTextFromStoredContent(props.sceneText)
-        : plainTextFromStoredContent(scene.content));
-    return total + countWords(documentFromPlainText(text));
-  }, 0) ?? 0;
+  const chapterWordCount =
+    activeChapter?.scenes.reduce((total, scene) => {
+      const text =
+        chapterContents[scene.id] ??
+        (scene.id === selectedScene?.id
+          ? plainTextFromStoredContent(props.sceneText)
+          : plainTextFromStoredContent(scene.content));
+      return total + countWords(documentFromPlainText(text));
+    }, 0) ?? 0;
 
   return (
     <section
@@ -1616,48 +2047,6 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
           <h1 id="page-title">{project.project.title}</h1>
         </div>
         <div className="heading-actions">
-          {chapterDocument && (
-            <button
-              className="secondary-button"
-              onClick={() => {
-                setChapterEditId(null);
-                setChapterContents({});
-              }}
-              type="button"
-            >
-              Scene view
-            </button>
-          )}
-          {activeChapter && selectedScene && (
-            <button
-              className="secondary-button"
-              aria-pressed={chapterDocument}
-              onClick={() => {
-                if (chapterDocument) {
-                  setChapterEditId(null);
-                  setChapterContents({});
-                } else {
-                  setChapterEditId(activeChapter.chapter.id);
-                }
-              }}
-              type="button"
-            >
-              {chapterDocument ? 'Scene view' : 'Edit whole chapter'}
-            </button>
-          )}
-          {chapterDocument && (
-            <button
-              className="secondary-button"
-              aria-pressed="true"
-              onClick={() => {
-                setChapterEditId(null);
-                setChapterContents({});
-              }}
-              type="button"
-            >
-              Scene view
-            </button>
-          )}
           {activeChapter && selectedScene && (
             <button
               className="secondary-button"
@@ -1688,6 +2077,13 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
             type="button"
           >
             Export plain text
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => void props.onExport('docx')}
+            type="button"
+          >
+            Export DOCX
           </button>
           <button
             className="secondary-button"
@@ -1729,6 +2125,75 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
           >
             AI writing
           </button>
+          {selectedScene && (
+            <button
+              className="secondary-button"
+              disabled={codexSuggestionBusy}
+              onClick={() => {
+                const text = plainTextFromStoredContent(props.sceneText);
+                setPendingCodexAnalysis({
+                  text,
+                  sceneIds: [selectedScene.id],
+                  label: selectedScene.title,
+                });
+                setCodexSuggestionError('');
+              }}
+              type="button"
+            >
+              {codexSuggestionBusy ? 'Analyzing…' : 'Suggest Codex from scene'}
+            </button>
+          )}
+          {project.chapters.some((chapter) => chapter.scenes.length > 0) && (
+            <button
+              className="secondary-button"
+              disabled={codexSuggestionBusy}
+              onClick={() => {
+                const scenes = project.chapters.flatMap((chapter) => chapter.scenes);
+                const text = project.chapters
+                  .map(
+                    (chapter) =>
+                      `${chapter.chapter.title}\n${chapter.scenes.map((scene) => `${scene.title}\n${plainTextFromStoredContent(scene.id === selectedScene?.id ? props.sceneText : (chapterContents[scene.id] ?? scene.content))}`).join('\n\n')}`,
+                  )
+                  .join('\n\n');
+                setPendingCodexAnalysis({
+                  text,
+                  sceneIds: scenes.map((scene) => scene.id),
+                  label: project.project.title,
+                });
+                setCodexSuggestionError('');
+              }}
+              type="button"
+            >
+              Suggest Codex from project
+            </button>
+          )}
+          {activeChapter && chapterEditId === activeChapter.chapter.id && (
+            <button
+              className="secondary-button"
+              disabled={codexSuggestionBusy}
+              onClick={() => {
+                const sourceChapter = project.chapters.find(
+                  (chapter) => chapter.chapter.id === chapterEditId,
+                );
+                const sourceScenes = sourceChapter?.scenes ?? [];
+                const text = sourceScenes
+                  .map(
+                    (scene) =>
+                      `${scene.title}\n${plainTextFromStoredContent(chapterContents[scene.id] ?? scene.content)}`,
+                  )
+                  .join('\n\n');
+                setPendingCodexAnalysis({
+                  text,
+                  sceneIds: sourceScenes.map((scene) => scene.id),
+                  label: sourceChapter?.chapter.title ?? 'Selected chapter',
+                });
+                setCodexSuggestionError('');
+              }}
+              type="button"
+            >
+              {codexSuggestionBusy ? 'Analyzing…' : 'Suggest Codex from chapter'}
+            </button>
+          )}
           <button
             className="secondary-button"
             onClick={props.onToggleFocus}
@@ -1767,7 +2232,11 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
                     aria-pressed={chapterEditId === chapter.chapter.id}
                     onClick={() => {
                       setChapterEditId(chapter.chapter.id);
-                      if (selectedScene?.id && chapter.scenes.some((scene) => scene.id === selectedScene.id)) return;
+                      if (
+                        selectedScene?.id &&
+                        chapter.scenes.some((scene) => scene.id === selectedScene.id)
+                      )
+                        return;
                       if (chapter.scenes[0]) props.onSelectScene(chapter.scenes[0]);
                       else props.onSelectChapter(chapter);
                     }}
@@ -1871,8 +2340,11 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
             ))
           )}
         </aside>
-        <div className="scene-editor">
-          {showingChapterDocument && activeChapter ? (
+        <div
+          className="scene-editor"
+          style={{ fontFamily: `"${props.writingTheme.fontFamily}", Georgia, serif` }}
+        >
+          {chapterDocument && activeChapter ? (
             <>
               <div className="scene-editor-heading">
                 <div>
@@ -1880,9 +2352,13 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
                   <h2>{activeChapter.chapter.title}</h2>
                 </div>
                 <span className="save-status" role="status">
-                  {activeChapter.scenes.some((scene) => props.chapterSceneSaveStates[scene.id] === 'error')
+                  {activeChapter.scenes.some(
+                    (scene) => props.chapterSceneSaveStates[scene.id] === 'error',
+                  )
                     ? 'Could not save a scene'
-                    : activeChapter.scenes.some((scene) => props.chapterSceneSaveStates[scene.id] === 'saving')
+                    : activeChapter.scenes.some(
+                          (scene) => props.chapterSceneSaveStates[scene.id] === 'saving',
+                        )
                       ? 'Saving chapter…'
                       : 'Saved locally'}
                 </span>
@@ -1891,17 +2367,31 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
                 {activeChapter.scenes.map((scene) => (
                   <section className="chapter-scene-section" key={scene.id}>
                     <h3 className="chapter-scene-divider">
-                      <span aria-hidden="true">────────</span>
+                      <span aria-hidden="true">
+                        {props.writingTheme.sceneDivider === 'ornament'
+                          ? '❦'
+                          : '────────'}
+                      </span>
                       <span>Scene · {scene.title}</span>
-                      <span aria-hidden="true">────────</span>
+                      <span aria-hidden="true">
+                        {props.writingTheme.sceneDivider === 'ornament'
+                          ? '❦'
+                          : '────────'}
+                      </span>
                     </h3>
                     <textarea
                       aria-label={`Text for ${scene.title} in ${activeChapter.chapter.title}`}
                       className="scene-textarea chapter-scene-textarea"
-                      value={chapterContents[scene.id] ?? plainTextFromStoredContent(scene.content)}
+                      value={
+                        chapterContents[scene.id] ??
+                        plainTextFromStoredContent(scene.content)
+                      }
                       onChange={(event) => {
                         const value = event.target.value;
-                        setChapterContents((current) => ({ ...current, [scene.id]: value }));
+                        setChapterContents((current) => ({
+                          ...current,
+                          [scene.id]: value,
+                        }));
                         props.onSaveChapterScene(
                           scene.id,
                           serializeEditorDocument(documentFromPlainText(value)),
@@ -1920,12 +2410,17 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
                     {props.chapterSceneSaveStates[scene.id] === 'error' && (
                       <button
                         className="secondary-button chapter-scene-retry"
-                        onClick={() => props.onSaveChapterScene(
-                          scene.id,
-                          serializeEditorDocument(
-                            documentFromPlainText(chapterContents[scene.id] ?? plainTextFromStoredContent(scene.content)),
-                          ),
-                        )}
+                        onClick={() =>
+                          props.onSaveChapterScene(
+                            scene.id,
+                            serializeEditorDocument(
+                              documentFromPlainText(
+                                chapterContents[scene.id] ??
+                                  plainTextFromStoredContent(scene.content),
+                              ),
+                            ),
+                          )
+                        }
                         type="button"
                       >
                         Retry save {scene.title}
@@ -1941,7 +2436,9 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
                 <span>
                   Chapter {chapterWordCount} words · Project {projectWords} words
                 </span>
-                <span className="keyboard-hint">Each scene saves separately; divider labels are not manuscript text.</span>
+                <span className="keyboard-hint">
+                  Each scene saves separately; divider labels are not manuscript text.
+                </span>
               </div>
             </>
           ) : selectedScene ? (
@@ -2025,6 +2522,236 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
           )}
         </div>
       </div>
+      {codexSuggestionError && (
+        <p className="form-error" role="alert">
+          {codexSuggestionError}
+        </p>
+      )}
+      {pendingCodexAnalysis && (
+        <section
+          className="codex-suggestion-review"
+          aria-label="Confirm Codex analysis scope"
+        >
+          <h2>Review text before analysis</h2>
+          <p>
+            This text will be sent to your configured AI provider. Review the exact
+            content before continuing.
+          </p>
+          <p>
+            <strong>Source:</strong> {pendingCodexAnalysis.label}
+          </p>
+          <textarea
+            aria-label="Text to analyze for Codex"
+            rows={8}
+            value={pendingCodexAnalysis.text}
+            onChange={(event) =>
+              setPendingCodexAnalysis((current) =>
+                current ? { ...current, text: event.target.value } : current,
+              )
+            }
+          />
+          <div className="heading-actions">
+            <button
+              className="primary-button"
+              disabled={!pendingCodexAnalysis.text.trim() || codexSuggestionBusy}
+              onClick={() => {
+                const pending = pendingCodexAnalysis;
+                setCodexSuggestionBusy(true);
+                setCodexSuggestionError('');
+                void props
+                  .onGenerateCodex(pending.text, pending.sceneIds, pending.label)
+                  .then((items) => {
+                    setCodexSuggestions(items);
+                    if (!items.length)
+                      setCodexSuggestionError(
+                        'No valid Codex suggestions were returned.',
+                      );
+                    if (items.length > 0) setPendingCodexAnalysis(null);
+                  })
+                  .catch((cause) => setCodexSuggestionError(errorMessage(cause)))
+                  .finally(() => setCodexSuggestionBusy(false));
+              }}
+              type="button"
+            >
+              {codexSuggestionBusy ? 'Analyzing…' : 'Send reviewed text'}
+            </button>
+            <button
+              className="text-button"
+              disabled={codexSuggestionBusy}
+              onClick={() => setPendingCodexAnalysis(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </section>
+      )}
+      {codexSuggestions.length > 0 && (
+        <section
+          className="codex-suggestion-review"
+          aria-label="Review Codex suggestions"
+        >
+          <div className="codex-suggestion-heading">
+            <div>
+              <h2>Review Codex suggestions</h2>
+              <p>
+                Nothing is saved until you accept a suggestion. Check the evidence before
+                adding it.
+              </p>
+            </div>
+            <button
+              className="text-button"
+              onClick={() => setCodexSuggestions([])}
+              type="button"
+            >
+              Discard all
+            </button>
+          </div>
+          {codexSuggestions.map((suggestion, index) => (
+            <article
+              className="codex-suggestion-card"
+              key={`${suggestion.kind}-${suggestion.title}-${index}`}
+            >
+              <label>
+                Type
+                <select
+                  value={suggestion.kind}
+                  onChange={(event) =>
+                    setCodexSuggestions((items) =>
+                      items.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? {
+                              ...item,
+                              kind: event.target.value as CodexSuggestion['kind'],
+                            }
+                          : item,
+                      ),
+                    )
+                  }
+                >
+                  {['character', 'location', 'item', 'general'].map((kind) => (
+                    <option key={kind} value={kind}>
+                      {capitalize(kind)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Title
+                <input
+                  value={suggestion.title}
+                  onChange={(event) =>
+                    setCodexSuggestions((items) =>
+                      items.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, title: event.target.value }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+              </label>
+              <label>
+                Description
+                <textarea
+                  rows={3}
+                  value={suggestion.description}
+                  onChange={(event) =>
+                    setCodexSuggestions((items) =>
+                      items.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, description: event.target.value }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+              </label>
+              {suggestion.evidence && (
+                <blockquote>Evidence: “{suggestion.evidence}”</blockquote>
+              )}
+              {suggestion.duplicateTitle && (
+                <p className="form-error" role="status">
+                  Possible duplicate: “{suggestion.duplicateTitle}” already exists. Review
+                  it before keeping a separate entry.
+                </p>
+              )}
+              <div className="heading-actions">
+                <button
+                  className="primary-button"
+                  disabled={!suggestion.title.trim()}
+                  onClick={() =>
+                    void props
+                      .onAcceptCodexSuggestion(
+                        suggestion,
+                        Boolean(suggestion.duplicateTitle),
+                      )
+                      .then((saved) => {
+                        if (saved)
+                          setCodexSuggestions((items) =>
+                            items.filter((_, itemIndex) => itemIndex !== index),
+                          );
+                      })
+                      .catch((cause) => setCodexSuggestionError(errorMessage(cause)))
+                  }
+                  type="button"
+                >
+                  {suggestion.duplicateTitle ? 'Keep separate and add' : 'Accept and add'}
+                </button>
+                {!suggestion.duplicateTitle && (
+                  <button
+                    className="text-button"
+                    disabled={checkingDuplicateIndex === index}
+                    onClick={() =>
+                      void (async () => {
+                        setCheckingDuplicateIndex(index);
+                        try {
+                          const duplicate = await props.onCheckCodexDuplicate(suggestion);
+                          setCodexSuggestions((items) =>
+                            items.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...suggestion, duplicateTitle: duplicate?.title }
+                                : item,
+                            ),
+                          );
+                        } catch (cause) {
+                          setCodexSuggestionError(errorMessage(cause));
+                        } finally {
+                          setCheckingDuplicateIndex(null);
+                        }
+                      })()
+                    }
+                    type="button"
+                  >
+                    Check duplicate
+                  </button>
+                )}
+                <button
+                  className="text-button"
+                  onClick={() =>
+                    setCodexSuggestions((items) =>
+                      items.filter((_, itemIndex) => itemIndex !== index),
+                    )
+                  }
+                  type="button"
+                >
+                  Skip
+                </button>
+              </div>
+            </article>
+          ))}
+          <button
+            className="secondary-button"
+            onClick={() => setCodexSuggestions([])}
+            type="button"
+          >
+            Close review
+          </button>
+          <p className="codex-muted">
+            Suggestions remain in this review only; none are added until accepted.
+          </p>
+        </section>
+      )}
       {restoreError && (
         <p className="form-error" role="alert">
           {restoreError}
@@ -2086,6 +2813,303 @@ function ProjectWorkspace(props: ProjectWorkspaceProps) {
             window.setTimeout(() => aiTriggerRef.current?.focus(), 0);
           }}
         />
+      )}
+    </section>
+  );
+}
+
+function TimelinePage(props: {
+  projects: Project[];
+  projectId: string;
+  projectDetail: ProjectDetail | null;
+  events: TimelineEvent[];
+  error: string;
+  onProjectChange: (id: string) => void;
+  onReload: () => void;
+  onCreate: (input: TimelineEventInput) => Promise<void>;
+  onUpdate: (event: TimelineEvent) => Promise<void>;
+  onDelete: (event: TimelineEvent) => Promise<void>;
+  onJumpToScene: (sceneId: string | null) => void;
+}) {
+  const project = props.projects.find((item) => item.id === props.projectId);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [title, setTitle] = useState('');
+  const [dateLabel, setDateLabel] = useState('');
+  const [sortOrder, setSortOrder] = useState('0');
+  const [description, setDescription] = useState('');
+  const [confidence, setConfidence] = useState<TimelineEvent['confidence']>('confirmed');
+  const [sourceSceneId, setSourceSceneId] = useState('');
+  const [dismissed, setDismissed] = useState(false);
+  const [includeDismissed, setIncludeDismissed] = useState(false);
+  const [formError, setFormError] = useState('');
+
+  const clearForm = () => {
+    setEditingId(null);
+    setTitle('');
+    setDateLabel('');
+    setSortOrder(String((props.events.at(-1)?.sortOrder ?? -1) + 1));
+    setDescription('');
+    setConfidence('confirmed');
+    setSourceSceneId('');
+    setDismissed(false);
+    setFormError('');
+  };
+  const editEvent = (event: TimelineEvent) => {
+    setEditingId(event.id);
+    setTitle(event.title);
+    setDateLabel(event.dateLabel);
+    setSortOrder(String(event.sortOrder));
+    setDescription(event.description);
+    setConfidence(event.confidence);
+    setSourceSceneId(event.sourceSceneId ?? '');
+    setDismissed(event.dismissed);
+    setFormError('');
+  };
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const order = Number(sortOrder);
+    if (!title.trim() || !Number.isFinite(order)) {
+      setFormError('Enter an event title and valid ordering number.');
+      return;
+    }
+    try {
+      if (editingId) {
+        const current = props.events.find((item) => item.id === editingId);
+        if (current)
+          await props.onUpdate({
+            ...current,
+            title: title.trim(),
+            dateLabel,
+            sortOrder: order,
+            description,
+            confidence,
+            sourceSceneId: sourceSceneId || null,
+            dismissed,
+          });
+      } else {
+        await props.onCreate({
+          projectId: props.projectId,
+          title: title.trim(),
+          dateLabel,
+          sortOrder: order,
+          description,
+          confidence,
+          sourceSceneId: sourceSceneId || null,
+          dismissed,
+        });
+      }
+      clearForm();
+    } catch (cause) {
+      setFormError(errorMessage(cause));
+    }
+  };
+
+  const visibleEvents = props.events.filter(
+    (event) => includeDismissed || !event.dismissed,
+  );
+  return (
+    <section className="page-content timeline-page" aria-labelledby="page-title">
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">STORY CHRONOLOGY</div>
+          <h1 id="page-title">Timeline</h1>
+          <p className="page-subtitle">
+            Manually record story events and their source passages.
+          </p>
+        </div>
+        <label>
+          Project
+          <select
+            aria-label="Timeline project"
+            value={props.projectId}
+            onChange={(event) => props.onProjectChange(event.target.value)}
+          >
+            {props.projects.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.title}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {props.error && (
+        <p className="form-error" role="alert">
+          {props.error}
+        </p>
+      )}
+      {!project ? (
+        <div className="section-empty">
+          <h2>Choose a project first.</h2>
+          <p>Create a local project before adding story events.</p>
+        </div>
+      ) : (
+        <div className="timeline-layout">
+          <section className="timeline-list" aria-label="Timeline events">
+            <div className="timeline-toolbar">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={includeDismissed}
+                  onChange={(event) => setIncludeDismissed(event.target.checked)}
+                />{' '}
+                Show dismissed
+              </label>
+              <button className="secondary-button" onClick={props.onReload} type="button">
+                Refresh
+              </button>
+            </div>
+            {visibleEvents.length === 0 ? (
+              <p className="codex-muted">
+                No timeline events yet. Add events manually; later analysis suggestions
+                should always be reviewed before saving.
+              </p>
+            ) : (
+              visibleEvents.map((event) => (
+                <article
+                  className={`timeline-event${event.dismissed ? ' is-dismissed' : ''}`}
+                  key={event.id}
+                >
+                  <span className="timeline-date">
+                    {event.dateLabel || `Order ${event.sortOrder}`}
+                  </span>
+                  <div>
+                    <h2>{event.title}</h2>
+                    <p>{event.description || 'No notes.'}</p>
+                    <small>
+                      {event.confidence}
+                      {event.sourceSceneId ? ' · linked to manuscript' : ''}
+                      {event.dismissed ? ' · dismissed' : ''}
+                    </small>
+                  </div>
+                  {event.sourceSceneId && (
+                    <button
+                      className="text-button"
+                      onClick={() => props.onJumpToScene(event.sourceSceneId)}
+                      type="button"
+                    >
+                      Open source
+                    </button>
+                  )}
+                  <button
+                    className="text-button"
+                    onClick={() => editEvent(event)}
+                    type="button"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    className="text-button"
+                    onClick={() =>
+                      void props.onUpdate({ ...event, dismissed: !event.dismissed })
+                    }
+                    type="button"
+                  >
+                    {event.dismissed ? 'Restore' : 'Dismiss'}
+                  </button>
+                  <button
+                    className="text-button"
+                    onClick={() => {
+                      if (window.confirm(`Delete timeline event “${event.title}”?`))
+                        void props.onDelete(event);
+                    }}
+                    type="button"
+                  >
+                    Delete
+                  </button>
+                </article>
+              ))
+            )}
+          </section>
+          <form className="timeline-form" onSubmit={(event) => void submit(event)}>
+            <h2>{editingId ? 'Edit event' : 'Add event'}</h2>
+            <label>
+              Event title
+              <input
+                value={title}
+                maxLength={200}
+                onChange={(event) => setTitle(event.target.value)}
+                required
+              />
+            </label>
+            <label>
+              Date or time expression
+              <input
+                value={dateLabel}
+                maxLength={120}
+                onChange={(event) => setDateLabel(event.target.value)}
+                placeholder="e.g. Three days after the storm"
+              />
+            </label>
+            <label>
+              Order
+              <input
+                type="number"
+                value={sortOrder}
+                onChange={(event) => setSortOrder(event.target.value)}
+                step="any"
+              />
+            </label>
+            <label>
+              Notes
+              <textarea
+                rows={4}
+                value={description}
+                maxLength={10000}
+                onChange={(event) => setDescription(event.target.value)}
+              />
+            </label>
+            <label>
+              Confidence
+              <select
+                value={confidence}
+                onChange={(event) =>
+                  setConfidence(event.target.value as TimelineEvent['confidence'])
+                }
+              >
+                <option value="confirmed">Confirmed</option>
+                <option value="inferred">Inferred</option>
+                <option value="uncertain">Uncertain</option>
+              </select>
+            </label>
+            <label>
+              Source scene
+              <select
+                value={sourceSceneId}
+                onChange={(event) => setSourceSceneId(event.target.value)}
+              >
+                <option value="">No source linked</option>
+                {props.projectDetail?.chapters.map((chapter) => (
+                  <Fragment key={chapter.chapter.id}>
+                    {chapter.scenes.map((scene) => (
+                      <option key={scene.id} value={scene.id}>
+                        {chapter.chapter.title} / {scene.title}
+                      </option>
+                    ))}
+                  </Fragment>
+                ))}
+              </select>
+            </label>
+            <p className="codex-muted">
+              Timeline facts are manual in this version. No manuscript text is
+              automatically analyzed.
+            </p>
+            {formError && (
+              <p className="form-error" role="alert">
+                {formError}
+              </p>
+            )}
+            <div className="heading-actions">
+              <button className="primary-button" type="submit">
+                {editingId ? 'Save event' : 'Add event'}
+              </button>
+              {editingId && (
+                <button className="text-button" onClick={clearForm} type="button">
+                  Cancel edit
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
       )}
     </section>
   );
@@ -2722,17 +3746,44 @@ function SettingsPage(props: {
   onThemeChange: (theme: Theme) => void;
   textScale: TextScale;
   onTextScaleChange: (scale: TextScale) => void;
+  writingThemes: WritingTheme[];
+  selectedWritingThemeId: string;
+  onSelectWritingTheme: (id: string) => void;
+  onSaveWritingThemes: (themes: WritingTheme[]) => void;
 }) {
+  const selectedWritingTheme =
+    props.writingThemes.find((item) => item.id === props.selectedWritingThemeId) ??
+    props.writingThemes[0];
+  const updateWritingTheme = (patch: Partial<WritingTheme>) => {
+    if (!selectedWritingTheme) return;
+    props.onSaveWritingThemes(
+      props.writingThemes.map((item) =>
+        item.id === selectedWritingTheme.id ? { ...item, ...patch } : item,
+      ),
+    );
+  };
+  const createWritingTheme = () => {
+    const theme: WritingTheme = {
+      ...DEFAULT_WRITING_THEMES[0],
+      id: crypto.randomUUID(),
+      name: 'My writing theme',
+    };
+    props.onSaveWritingThemes([...props.writingThemes, theme]);
+    props.onSelectWritingTheme(theme.id);
+  };
   const [settings, setSettings] = useState<AiSettings>({
     provider: 'openai-compatible',
     model: '',
     endpoint: 'https://api.openai.com/v1',
   });
+  const [themeError, setThemeError] = useState('');
   const [credentialPresent, setCredentialPresent] = useState(false);
   const [secret, setSecret] = useState('');
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [modelsBusy, setModelsBusy] = useState(false);
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [settingsLoading, setSettingsLoading] = useState(true);
 
   const providerHasCredential = settings.provider !== 'ollama';
@@ -2845,6 +3896,26 @@ function SettingsPage(props: {
     }
   };
 
+  const refreshOllamaModels = async () => {
+    setModelsBusy(true);
+    setError('');
+    setStatus('Loading models from Ollama…');
+    try {
+      const models = await aiService.listOllamaModels(settings.endpoint);
+      setOllamaModels(models);
+      setStatus(
+        models.length
+          ? `Found ${models.length} Ollama model${models.length === 1 ? '' : 's'}.`
+          : 'Ollama is available, but no models are installed yet.',
+      );
+    } catch (cause) {
+      setStatus('');
+      setError(errorMessage(cause));
+    } finally {
+      setModelsBusy(false);
+    }
+  };
+
   return (
     <section className="page-content secondary-page" aria-labelledby="page-title">
       <div className="page-heading">
@@ -2898,6 +3969,280 @@ function SettingsPage(props: {
           </select>
         </label>
       </section>
+      <section
+        className="settings-card writing-theme-settings"
+        aria-labelledby="writing-theme-title"
+      >
+        <div>
+          <h2 id="writing-theme-title">Writing themes</h2>
+          <p>Customize the manuscript page. Your themes are stored on this device.</p>
+        </div>
+        <div className="writing-theme-controls">
+          <label>
+            Selected writing theme
+            <select
+              aria-label="Writing theme"
+              value={selectedWritingTheme?.id ?? ''}
+              onChange={(event) => props.onSelectWritingTheme(event.target.value)}
+            >
+              {props.writingThemes.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="heading-actions">
+            <button
+              className="secondary-button"
+              onClick={createWritingTheme}
+              type="button"
+            >
+              Create theme
+            </button>
+            {selectedWritingTheme && props.writingThemes.length > 1 && (
+              <button
+                className="text-button"
+                onClick={() => {
+                  const next = props.writingThemes.filter(
+                    (item) => item.id !== selectedWritingTheme.id,
+                  );
+                  props.onSaveWritingThemes(next);
+                  props.onSelectWritingTheme(next[0].id);
+                }}
+                type="button"
+              >
+                Delete selected
+              </button>
+            )}
+          </div>
+          {selectedWritingTheme && (
+            <>
+              <label>
+                Theme name
+                <input
+                  aria-label="Writing theme name"
+                  value={selectedWritingTheme.name}
+                  onChange={(event) => updateWritingTheme({ name: event.target.value })}
+                  maxLength={80}
+                />
+              </label>
+              <label>
+                Writing font
+                <select
+                  aria-label="Writing font"
+                  value={selectedWritingTheme.fontFamily}
+                  onChange={(event) =>
+                    updateWritingTheme({ fontFamily: event.target.value })
+                  }
+                >
+                  {WRITING_FONTS.map((font) => (
+                    <option key={font} value={font}>
+                      {font}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Heading font
+                <select
+                  aria-label="Writing heading font"
+                  value={
+                    selectedWritingTheme.headingFontFamily ??
+                    selectedWritingTheme.fontFamily
+                  }
+                  onChange={(event) =>
+                    updateWritingTheme({ headingFontFamily: event.target.value })
+                  }
+                >
+                  {WRITING_FONTS.map((font) => (
+                    <option key={font} value={font}>
+                      {font}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Scene divider
+                <select
+                  aria-label="Scene divider style"
+                  value={selectedWritingTheme.sceneDivider ?? 'line'}
+                  onChange={(event) =>
+                    updateWritingTheme({
+                      sceneDivider: event.target.value as WritingTheme['sceneDivider'],
+                    })
+                  }
+                >
+                  <option value="line">Line</option>
+                  <option value="ornament">Ornament</option>
+                  <option value="simple">Simple</option>
+                </select>
+              </label>
+              <label>
+                Content width · {selectedWritingTheme.contentWidth}px
+                <input
+                  aria-label="Writing content width"
+                  type="range"
+                  min="480"
+                  max="1200"
+                  step="20"
+                  value={selectedWritingTheme.contentWidth}
+                  onChange={(event) =>
+                    updateWritingTheme({ contentWidth: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <div className="heading-actions">
+                <button
+                  className="secondary-button"
+                  onClick={() => {
+                    const copy = {
+                      ...selectedWritingTheme,
+                      id: crypto.randomUUID(),
+                      name: `${selectedWritingTheme.name} copy`,
+                    };
+                    props.onSaveWritingThemes([...props.writingThemes, copy]);
+                    props.onSelectWritingTheme(copy.id);
+                  }}
+                  type="button"
+                >
+                  Duplicate theme
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={() => {
+                    const blob = new Blob([exportWritingTheme(selectedWritingTheme)], {
+                      type: 'application/json',
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const anchor = document.createElement('a');
+                    anchor.href = url;
+                    anchor.download = `${selectedWritingTheme.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.noveler-theme.json`;
+                    anchor.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  type="button"
+                >
+                  Export theme
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={() => document.getElementById('writing-theme-import')?.click()}
+                  type="button"
+                >
+                  Import theme
+                </button>
+                <input
+                  id="writing-theme-import"
+                  type="file"
+                  accept="application/json,.json"
+                  aria-label="Import writing theme"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = '';
+                    if (!file) return;
+                    setThemeError('');
+                    void file
+                      .text()
+                      .then((text) => {
+                        const imported = parseWritingThemeImport(text);
+                        if (props.writingThemes.length >= 100)
+                          throw new Error(
+                            'A maximum of 100 writing themes is supported.',
+                          );
+                        props.onSaveWritingThemes([...props.writingThemes, imported]);
+                        props.onSelectWritingTheme(imported.id);
+                      })
+                      .catch((cause) => setThemeError(errorMessage(cause)));
+                  }}
+                />
+              </div>
+              {themeError && (
+                <p className="form-error" role="alert">
+                  {themeError}
+                </p>
+              )}
+              <div className="theme-color-row">
+                <label>
+                  Page color
+                  <input
+                    aria-label="Page color"
+                    type="color"
+                    value={selectedWritingTheme.background}
+                    onChange={(event) =>
+                      updateWritingTheme({ background: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Text color
+                  <input
+                    aria-label="Text color"
+                    type="color"
+                    value={selectedWritingTheme.foreground}
+                    onChange={(event) =>
+                      updateWritingTheme({ foreground: event.target.value })
+                    }
+                  />
+                </label>
+              </div>
+              {contrastRatio(
+                selectedWritingTheme.background,
+                selectedWritingTheme.foreground,
+              ) < 4.5 && (
+                <p className="form-error" role="alert">
+                  Text contrast is below the recommended 4.5:1. Choose more contrasting
+                  colors for readability.
+                </p>
+              )}
+              <label>
+                Text size · {selectedWritingTheme.fontSize}px
+                <input
+                  aria-label="Writing font size"
+                  type="range"
+                  min="14"
+                  max="32"
+                  value={selectedWritingTheme.fontSize}
+                  onChange={(event) =>
+                    updateWritingTheme({ fontSize: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label>
+                Line spacing · {selectedWritingTheme.lineHeight.toFixed(2)}
+                <input
+                  aria-label="Writing line spacing"
+                  type="range"
+                  min="1.2"
+                  max="2.4"
+                  step="0.05"
+                  value={selectedWritingTheme.lineHeight}
+                  onChange={(event) =>
+                    updateWritingTheme({ lineHeight: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <div
+                className="writing-theme-preview"
+                style={{
+                  background: selectedWritingTheme.background,
+                  color: selectedWritingTheme.foreground,
+                  fontFamily: `"${selectedWritingTheme.fontFamily}", Georgia, serif`,
+                  fontSize: `${selectedWritingTheme.fontSize}px`,
+                  lineHeight: selectedWritingTheme.lineHeight,
+                }}
+              >
+                <strong>A sample manuscript page</strong>
+                <p>
+                  The quick brown fox crosses the old bridge as morning light fills the
+                  valley.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      </section>
       <section className="ai-settings-card" aria-labelledby="ai-settings-title">
         <div className="settings-card-icon">
           <Sparkles size={19} />
@@ -2929,20 +4274,55 @@ function SettingsPage(props: {
           </label>
           <label>
             Model
-            <input
-              value={settings.model}
-              onChange={(event) =>
-                setSettings({ ...settings, model: event.target.value })
-              }
-              placeholder={
-                settings.provider === 'ollama'
-                  ? 'e.g. llama3.2'
-                  : settings.provider === 'openrouter'
-                    ? 'e.g. openai/gpt-4o-mini'
-                    : 'e.g. gpt-4o-mini'
-              }
-            />
+            {settings.provider === 'ollama' && ollamaModels.length > 0 ? (
+              <select
+                aria-label="Model"
+                value={settings.model}
+                onChange={(event) =>
+                  setSettings({ ...settings, model: event.target.value })
+                }
+              >
+                {!ollamaModels.includes(settings.model) && settings.model && (
+                  <option value={settings.model}>{settings.model} (selected)</option>
+                )}
+                {ollamaModels.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                aria-label="Model"
+                value={settings.model}
+                onChange={(event) =>
+                  setSettings({ ...settings, model: event.target.value })
+                }
+                placeholder={
+                  settings.provider === 'ollama'
+                    ? 'e.g. llama3.2'
+                    : settings.provider === 'openrouter'
+                      ? 'e.g. openai/gpt-4o-mini'
+                      : 'e.g. gpt-4o-mini'
+                }
+              />
+            )}
           </label>
+          {settings.provider === 'ollama' && (
+            <div className="ai-settings-actions">
+              <button
+                className="secondary-button"
+                disabled={busy || modelsBusy || settingsLoading}
+                onClick={() => void refreshOllamaModels()}
+                type="button"
+              >
+                {modelsBusy ? 'Loading models…' : 'List available models'}
+              </button>
+              <span className="settings-footnote">
+                Lists models installed in your local Ollama instance.
+              </span>
+            </div>
+          )}
           <label>
             Endpoint
             <input

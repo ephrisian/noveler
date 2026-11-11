@@ -1,4 +1,6 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use tauri::State;
 
 use crate::ai::{
@@ -8,6 +10,155 @@ use crate::ai::{
 use crate::db::{
     self, AppError, Chapter, CodexEntry, CodexEntryDetail, Database, Project, ProjectDetail, Scene,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearanceSettings {
+    pub version: u32,
+    pub themes: Value,
+    pub selected_theme_id: String,
+    pub theme: String,
+    pub text_scale: String,
+}
+
+pub struct AppearanceStore {
+    path: PathBuf,
+}
+
+impl AppearanceStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+    fn load(&self) -> Result<AppearanceSettings, String> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| "Stored appearance settings are invalid.".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppearanceSettings {
+                version: 1,
+                themes: Value::Array(vec![]),
+                selected_theme_id: String::new(),
+                theme: "light".into(),
+                text_scale: "1".into(),
+            }),
+            Err(_) => Err("Appearance settings could not be read.".into()),
+        }
+    }
+    fn save(&self, settings: AppearanceSettings) -> Result<(), String> {
+        if settings.version != 1
+            || settings
+                .themes
+                .as_array()
+                .map_or(true, |items| items.len() > 100)
+            || settings.selected_theme_id.chars().count() > 80
+            || !matches!(settings.theme.as_str(), "light" | "dark")
+            || !matches!(settings.text_scale.as_str(), "1" | "1.15" | "1.3")
+        {
+            return Err("Appearance settings are invalid.".into());
+        }
+        if let Some(themes) = settings.themes.as_array() {
+            let mut ids = std::collections::HashSet::new();
+            for theme in themes {
+                let object = theme
+                    .as_object()
+                    .ok_or_else(|| "Appearance theme is invalid.".to_string())?;
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.chars().count() <= 80)
+                    .ok_or_else(|| "Appearance theme ID is invalid.".to_string())?;
+                if !ids.insert(id.to_owned()) {
+                    return Err("Appearance theme IDs must be unique.".into());
+                }
+            }
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "Appearance settings path is invalid.".to_string())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Appearance settings could not be saved.".to_string())?;
+        let bytes = serde_json::to_vec_pretty(&settings)
+            .map_err(|_| "Appearance settings could not be saved.".to_string())?;
+        let temporary = self.path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)
+            .map_err(|_| "Appearance settings could not be saved.".to_string())?;
+        std::fs::rename(temporary, &self.path)
+            .map_err(|_| "Appearance settings could not be saved.".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn get_appearance_settings(
+    store: State<'_, AppearanceStore>,
+) -> Result<AppearanceSettings, String> {
+    store.load()
+}
+
+#[tauri::command]
+pub fn save_appearance_settings(
+    store: State<'_, AppearanceStore>,
+    settings: AppearanceSettings,
+) -> Result<(), String> {
+    store.save(settings)
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::{AppearanceSettings, AppearanceStore};
+    use serde_json::Value;
+
+    #[test]
+    fn appearance_store_persists_valid_versioned_preferences_and_rejects_invalid_values() {
+        let path =
+            std::env::temp_dir().join(format!("noveler-appearance-{}.json", uuid::Uuid::new_v4()));
+        let store = AppearanceStore::new(path.clone());
+        let settings = AppearanceSettings {
+            version: 1,
+            themes: Value::Array(vec![serde_json::json!({ "id": "paper", "name": "Paper" })]),
+            selected_theme_id: "paper".into(),
+            theme: "dark".into(),
+            text_scale: "1.15".into(),
+        };
+        store.save(settings.clone()).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+        let mut invalid = settings;
+        invalid.theme = "sepia".into();
+        assert!(store.save(invalid).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn appearance_store_limits_theme_count_and_selected_id() {
+        let path = std::env::temp_dir().join(format!(
+            "noveler-appearance-limit-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let store = AppearanceStore::new(path.clone());
+        let mut settings = AppearanceSettings {
+            version: 1,
+            themes: Value::Array(vec![Value::Null; 101]),
+            selected_theme_id: String::new(),
+            theme: "light".into(),
+            text_scale: "1".into(),
+        };
+        assert!(store.save(settings.clone()).is_err());
+        settings.themes = Value::Array(vec![]);
+        settings.selected_theme_id = "x".repeat(81);
+        assert!(store.save(settings).is_err());
+        let duplicate = AppearanceSettings {
+            version: 1,
+            themes: Value::Array(vec![
+                serde_json::json!({ "id": "same" }),
+                serde_json::json!({ "id": "same" }),
+            ]),
+            selected_theme_id: "same".into(),
+            theme: "light".into(),
+            text_scale: "1".into(),
+        };
+        assert!(store.save(duplicate).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 fn user_error(error: AppError) -> String {
     match error {
@@ -216,6 +367,33 @@ pub fn create_codex_entry(
 }
 
 #[tauri::command]
+pub fn create_codex_entry_with_sources(
+    database: State<'_, Database>,
+    project_id: String,
+    kind: String,
+    title: String,
+    description: String,
+    tags: Vec<String>,
+    fields: Value,
+    scene_ids: Vec<String>,
+) -> Result<CodexEntry, String> {
+    database
+        .with_connection(|connection| {
+            db::repository::create_codex_entry_with_sources(
+                connection,
+                &project_id,
+                &kind,
+                &title,
+                &description,
+                &tags,
+                &fields,
+                &scene_ids,
+            )
+        })
+        .map_err(user_error)
+}
+
+#[tauri::command]
 pub fn update_codex_entry(
     database: State<'_, Database>,
     id: String,
@@ -357,6 +535,53 @@ pub fn export_manuscript(
 }
 
 #[tauri::command]
+pub fn list_timeline_events(
+    database: State<'_, Database>,
+    project_id: String,
+) -> Result<Vec<db::repository::TimelineEvent>, String> {
+    database
+        .with_connection(|connection| db::repository::list_timeline_events(connection, &project_id))
+        .map_err(user_error)
+}
+
+#[tauri::command]
+pub fn create_timeline_event(
+    database: State<'_, Database>,
+    input: db::repository::TimelineEventInput,
+) -> Result<db::repository::TimelineEvent, String> {
+    database
+        .with_connection(|connection| db::repository::create_timeline_event(connection, &input))
+        .map_err(user_error)
+}
+
+#[tauri::command]
+pub fn update_timeline_event(
+    database: State<'_, Database>,
+    input: db::repository::TimelineEvent,
+) -> Result<db::repository::TimelineEvent, String> {
+    database
+        .with_connection(|connection| db::repository::update_timeline_event(connection, &input))
+        .map_err(user_error)
+}
+
+#[tauri::command]
+pub fn delete_timeline_event(database: State<'_, Database>, id: String) -> Result<(), String> {
+    database
+        .with_connection(|connection| db::repository::delete_timeline_event(connection, &id))
+        .map_err(user_error)
+}
+
+#[tauri::command]
+pub fn import_manuscript(
+    database: State<'_, Database>,
+    input: db::repository::ManuscriptImport,
+) -> Result<Project, String> {
+    database
+        .with_connection(|connection| db::repository::import_manuscript(connection, &input))
+        .map_err(user_error)
+}
+
+#[tauri::command]
 pub fn get_ai_settings(service: State<'_, AiService>) -> Result<AiSettings, String> {
     service.settings.load().map_err(ai_user_error)
 }
@@ -401,6 +626,13 @@ pub fn ai_delete_credential(service: State<'_, AiService>, provider: String) -> 
 #[tauri::command]
 pub async fn ai_test_connection(service: State<'_, AiService>) -> Result<(), String> {
     service.test_connection().await.map_err(ai_user_error)
+}
+
+#[tauri::command]
+pub async fn ai_list_ollama_models(endpoint: String) -> Result<Vec<String>, String> {
+    crate::ai::OpenAiCompatibleProvider::list_ollama_models(&endpoint)
+        .await
+        .map_err(ai_user_error)
 }
 
 /// Called only from an explicit user action. Request content is not persisted or logged.

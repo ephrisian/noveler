@@ -1,0 +1,46 @@
+# JavaScript dependencies and generated frontend output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Rust and Tauri build output
+/target/
+/src-tauri/target/
+/src-tauri/gen/
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+
+# Python/tooling environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Local application databases and logs (keep checked-in fixtures explicit)
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

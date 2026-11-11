@@ -125,6 +125,68 @@ impl OpenAiCompatibleProvider {
         Ok(endpoint.to_string())
     }
 
+    pub async fn list_ollama_models(endpoint: &str) -> Result<Vec<String>, AiError> {
+        let endpoint = reqwest::Url::parse(endpoint)
+            .map_err(|_| AiError::InvalidSettings("Ollama endpoint URL is invalid".into()))?;
+        let host = endpoint
+            .host_str()
+            .ok_or_else(|| AiError::InvalidSettings("Ollama endpoint must use loopback".into()))?;
+        if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+            return Err(AiError::InvalidSettings(
+                "Ollama must use a local loopback endpoint".into(),
+            ));
+        }
+        let port = endpoint.port_or_known_default().ok_or_else(|| {
+            AiError::InvalidSettings("Ollama endpoint must include a valid port".into())
+        })?;
+        let addresses = tokio::net::lookup_host((host, port)).await.map_err(|_| {
+            AiError::InvalidSettings("Ollama endpoint must resolve to this device".into())
+        })?;
+        if addresses
+            .into_iter()
+            .any(|address| !address.ip().is_loopback())
+        {
+            return Err(AiError::InvalidSettings(
+                "Ollama endpoint resolves to a non-local address".into(),
+            ));
+        }
+
+        let mut url = endpoint;
+        let base_path = url.path().trim_end_matches('/').trim_end_matches("/v1");
+        url.set_path(&format!("{base_path}/api/tags"));
+        url.set_query(None);
+        let response = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| AiError::Network)?
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    AiError::Timeout
+                } else {
+                    AiError::Network
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(AiError::ProviderStatus(response.status().as_u16()));
+        }
+        #[derive(Deserialize)]
+        struct OllamaTagsResponse {
+            models: Vec<OllamaModel>,
+        }
+        #[derive(Deserialize)]
+        struct OllamaModel {
+            name: String,
+        }
+        let result: OllamaTagsResponse = response
+            .json()
+            .await
+            .map_err(|_| AiError::InvalidResponse)?;
+        Ok(result.models.into_iter().map(|model| model.name).collect())
+    }
+
     async fn post(
         &self,
         settings: &ProviderSettings,
@@ -891,6 +953,27 @@ mod tests {
         let result = provider.complete(&settings, "", &request()).await.unwrap();
         assert_eq!(result.text, "Local answer");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_model_listing_parses_installed_models() {
+        let (endpoint, server) = mock_server(
+            "200 OK",
+            r#"{"models":[{"name":"llama3.2:latest"},{"name":"mistral"}]}"#,
+        );
+        let models = OpenAiCompatibleProvider::list_ollama_models(&endpoint)
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["llama3.2:latest", "mistral"]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_model_listing_rejects_remote_endpoints() {
+        let error = OpenAiCompatibleProvider::list_ollama_models("https://ollama.example/v1")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AiError::InvalidSettings(_)));
     }
 
     #[tokio::test]

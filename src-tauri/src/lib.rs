@@ -13,6 +13,9 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let database = db::Database::open(data_dir.join("noveler.sqlite3"))?;
             app.manage(database);
+            app.manage(commands::AppearanceStore::new(
+                data_dir.join("appearance-settings.json"),
+            ));
             let ai_service = ai::AiService {
                 settings: Box::new(ai::FileSettingsStore::new(
                     data_dir.join("ai-settings.json"),
@@ -44,6 +47,7 @@ pub fn run() {
             commands::save_chapter_scene_contents,
             commands::list_codex_entries,
             commands::create_codex_entry,
+            commands::create_codex_entry_with_sources,
             commands::update_codex_entry,
             commands::delete_codex_entry,
             commands::get_codex_entry_detail,
@@ -54,6 +58,13 @@ pub fn run() {
             commands::export_project_backup,
             commands::restore_project_backup,
             commands::export_manuscript,
+            commands::get_appearance_settings,
+            commands::save_appearance_settings,
+            commands::list_timeline_events,
+            commands::create_timeline_event,
+            commands::update_timeline_event,
+            commands::delete_timeline_event,
+            commands::import_manuscript,
             commands::get_ai_settings,
             commands::save_ai_settings,
             commands::configure_ai_provider,
@@ -61,6 +72,7 @@ pub fn run() {
             commands::ai_save_credential,
             commands::ai_delete_credential,
             commands::ai_test_connection,
+            commands::ai_list_ollama_models,
             commands::ai_chat,
             commands::ai_get_local_data,
             commands::ai_save_templates,

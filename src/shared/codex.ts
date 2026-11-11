@@ -10,6 +10,13 @@ export interface CodexService {
       'projectId' | 'kind' | 'title' | 'description' | 'tags' | 'fields'
     >,
   ): Promise<CodexEntry>;
+  createWithSources(
+    input: Pick<
+      CodexEntry,
+      'projectId' | 'kind' | 'title' | 'description' | 'tags' | 'fields'
+    >,
+    sceneIds: string[],
+  ): Promise<CodexEntry>;
   update(entry: CodexEntry): Promise<CodexEntry>;
   remove(id: string): Promise<void>;
   linkEntries(
@@ -37,6 +44,16 @@ export const codexService: CodexService = {
   detail: (id) => invoke('get_codex_entry_detail', { id }),
   create: ({ projectId, kind, title, description, tags, fields }) =>
     invoke('create_codex_entry', { projectId, kind, title, description, tags, fields }),
+  createWithSources: ({ projectId, kind, title, description, tags, fields }, sceneIds) =>
+    invoke('create_codex_entry_with_sources', {
+      projectId,
+      kind,
+      title,
+      description,
+      tags,
+      fields,
+      sceneIds,
+    }),
   update: ({ id, kind, title, description, tags, fields }) =>
     invoke('update_codex_entry', { id, kind, title, description, tags, fields }),
   remove: (id) => invoke('delete_codex_entry', { id }),

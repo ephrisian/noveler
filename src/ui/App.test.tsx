@@ -31,6 +31,7 @@ const codexServiceMock = vi.hoisted(() => ({
   list: vi.fn(),
   detail: vi.fn(),
   create: vi.fn(),
+  createWithSources: vi.fn(),
   update: vi.fn(),
   remove: vi.fn(),
   linkEntries: vi.fn(),
@@ -48,23 +49,46 @@ const aiServiceMock = vi.hoisted(() => ({
   saveCredential: vi.fn(),
   deleteCredential: vi.fn(),
   testConnection: vi.fn(),
+  listOllamaModels: vi.fn(),
   chat: vi.fn(),
   getLocalData: vi.fn(),
   saveTemplates: vi.fn(),
   recordInteraction: vi.fn(),
   clearHistory: vi.fn(),
+  getAppearanceSettings: vi.fn(),
+  saveAppearanceSettings: vi.fn(),
 }));
 
 vi.mock('../shared/ai', () => ({ aiService: aiServiceMock }));
+
+const timelineServiceMock = vi.hoisted(() => ({
+  list: vi.fn(),
+  create: vi.fn(),
+  update: vi.fn(),
+  remove: vi.fn(),
+}));
+vi.mock('../shared/timeline', async () => {
+  const actual =
+    await vi.importActual<typeof import('../shared/timeline')>('../shared/timeline');
+  return { ...actual, timelineService: timelineServiceMock };
+});
 
 const portableServiceMock = vi.hoisted(() => ({
   search: vi.fn(),
   exportManuscript: vi.fn(),
   exportBackup: vi.fn(),
   restoreBackup: vi.fn(),
+  importManuscript: vi.fn(),
 }));
 
-vi.mock('../shared/portable', () => ({ portableService: portableServiceMock }));
+vi.mock('../shared/portable', async () => {
+  const actual =
+    await vi.importActual<typeof import('../shared/portable')>('../shared/portable');
+  return {
+    ...actual,
+    portableService: { ...actual.portableService, ...portableServiceMock },
+  };
+});
 
 const project: Project = {
   id: 'project-1',
@@ -145,6 +169,11 @@ beforeEach(() => {
     ...input,
     id: 'codex-created',
   }));
+  codexServiceMock.createWithSources.mockImplementation(async (input) => ({
+    ...codexEntry,
+    ...input,
+    id: 'generated-1',
+  }));
   codexServiceMock.update.mockImplementation(async (entry) => entry);
   codexServiceMock.remove.mockResolvedValue(undefined);
   codexServiceMock.linkEntries.mockResolvedValue(undefined);
@@ -170,15 +199,36 @@ beforeEach(() => {
   aiServiceMock.saveCredential.mockResolvedValue(undefined);
   aiServiceMock.deleteCredential.mockResolvedValue(undefined);
   aiServiceMock.testConnection.mockResolvedValue(undefined);
+  aiServiceMock.listOllamaModels.mockResolvedValue([]);
   aiServiceMock.chat.mockResolvedValue({ text: 'A response', model: 'model' });
   aiServiceMock.getLocalData.mockResolvedValue({ templates: [], history: [] });
   aiServiceMock.saveTemplates.mockResolvedValue(undefined);
   aiServiceMock.recordInteraction.mockResolvedValue(undefined);
   aiServiceMock.clearHistory.mockResolvedValue(undefined);
+  aiServiceMock.getAppearanceSettings.mockResolvedValue({
+    version: 1,
+    themes: [],
+    selectedThemeId: '',
+    theme: 'light',
+    textScale: '1',
+  });
+  aiServiceMock.saveAppearanceSettings.mockResolvedValue(undefined);
+  timelineServiceMock.list.mockResolvedValue([]);
+  timelineServiceMock.create.mockImplementation(async (input) => ({
+    id: 'event-1',
+    ...input,
+    sourceSceneId: input.sourceSceneId ?? null,
+    dismissed: input.dismissed ?? false,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+  }));
+  timelineServiceMock.update.mockImplementation(async (input) => input);
+  timelineServiceMock.remove.mockResolvedValue(undefined);
   portableServiceMock.search.mockResolvedValue([]);
   portableServiceMock.exportManuscript.mockResolvedValue('');
   portableServiceMock.exportBackup.mockResolvedValue('{}');
   portableServiceMock.restoreBackup.mockResolvedValue(project);
+  portableServiceMock.importManuscript.mockResolvedValue(project);
 });
 
 describe('application shell', () => {
@@ -261,6 +311,277 @@ describe('application shell', () => {
       expect(document.documentElement).toHaveAttribute('data-theme', 'dark'),
     );
     expect(document.documentElement.style.getPropertyValue('--ui-scale')).toBe('1.15');
+  });
+
+  it('shows timeline events and supports creating, dismissing, and deleting them', async () => {
+    const user = userEvent.setup();
+    projectServiceMock.listProjects.mockResolvedValue([project]);
+    projectServiceMock.openProject.mockResolvedValue(detail);
+    timelineServiceMock.list.mockResolvedValue([]);
+    render(<App />);
+    await user.click(screen.getByRole('button', { name: 'Timeline' }));
+    await screen.findByRole('heading', { name: 'Timeline' });
+    expect(timelineServiceMock.list).toHaveBeenCalledWith(project.id);
+    await user.type(screen.getByLabelText('Event title'), 'The bridge falls');
+    await user.type(screen.getByLabelText('Date or time expression'), 'Night 2');
+    await user.selectOptions(screen.getByLabelText('Source scene'), 'scene-1');
+    await user.click(screen.getByRole('button', { name: 'Add event' }));
+    await waitFor(() =>
+      expect(timelineServiceMock.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'The bridge falls', sourceSceneId: 'scene-1' }),
+      ),
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'The bridge falls' }),
+    ).toBeVisible();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(timelineServiceMock.update).toHaveBeenCalledWith(
+      expect.objectContaining({ dismissed: true }),
+    );
+    await user.click(screen.getByRole('checkbox', { name: 'Show dismissed' }));
+    await user.click(await screen.findByRole('button', { name: 'Delete' }));
+    expect(confirm).toHaveBeenCalled();
+    expect(timelineServiceMock.remove).toHaveBeenCalledWith('event-1');
+    confirm.mockRestore();
+  });
+
+  it('previews manuscript imports before creating a new project', async () => {
+    const user = userEvent.setup();
+    projectServiceMock.listProjects.mockResolvedValue([]);
+    render(<App />);
+    const file = new File(
+      ['# Chapter One\n\n## Arrival\n\nThe ship docked.'],
+      'novel.md',
+      { type: 'text/markdown' },
+    );
+    const input = screen.getByLabelText(
+      'Choose manuscript to import',
+    ) as HTMLInputElement;
+    Object.defineProperty(input, 'files', { configurable: true, value: [file] });
+    fireEvent.change(input, {
+      target: { files: [file] },
+    });
+    await screen.findByRole('region', { name: 'Manuscript import preview' });
+    expect(screen.getByText('novel')).toBeVisible();
+    expect(screen.getByText(/Chapter One/)).toBeVisible();
+    expect(portableServiceMock.importManuscript).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Create project from import' }));
+    await waitFor(() =>
+      expect(portableServiceMock.importManuscript).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'novel', chapters: expect.any(Array) }),
+      ),
+    );
+  });
+
+  it('requires review before sending manuscript text for Codex suggestions and accepts only selected entries', async () => {
+    const user = userEvent.setup();
+    projectServiceMock.listProjects.mockResolvedValue([project]);
+    aiServiceMock.chat.mockResolvedValue({
+      text: JSON.stringify({
+        suggestions: [
+          {
+            kind: 'character',
+            title: 'Mira',
+            description: 'A cartographer.',
+            tags: ['north'],
+            fields: {},
+            evidence: 'Mira checked the map.',
+          },
+        ],
+      }),
+      model: 'test-model',
+    });
+    codexServiceMock.createWithSources.mockResolvedValue({
+      ...codexEntry,
+      id: 'generated-1',
+      title: 'Mira',
+    });
+    render(<App />);
+    await user.click(
+      within(await screen.findByRole('article')).getByRole('button', {
+        name: /The Quiet Map Updated/,
+      }),
+    );
+    await waitFor(() =>
+      expect(codexServiceMock.list).toHaveBeenCalledWith(project.id, '', null),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: 'Suggest Codex from scene' }),
+    );
+    expect(aiServiceMock.chat).not.toHaveBeenCalled();
+    const reviewText = screen.getByRole('textbox', { name: 'Text to analyze for Codex' });
+    expect(reviewText).toHaveValue('A remembered opening.');
+    await user.clear(reviewText);
+    await user.type(reviewText, 'Mira checked the map.');
+    await user.click(screen.getByRole('button', { name: 'Send reviewed text' }));
+    await screen.findByRole('region', { name: 'Review Codex suggestions' });
+    expect(aiServiceMock.chat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: [
+          expect.objectContaining({
+            content: expect.stringContaining('Mira checked the map.'),
+          }),
+        ],
+      }),
+    );
+    expect(codexServiceMock.create).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Accept and add' }));
+    await waitFor(() =>
+      expect(codexServiceMock.createWithSources).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Mira', projectId: project.id }),
+        ['scene-1'],
+      ),
+    );
+  });
+
+  it('warns before saving a same-kind Codex duplicate and leaves the suggestion in review if declined', async () => {
+    const user = userEvent.setup();
+    projectServiceMock.listProjects.mockResolvedValue([project]);
+    codexServiceMock.list.mockResolvedValue([codexEntry]);
+    codexServiceMock.createWithSources.mockResolvedValue({
+      ...codexEntry,
+      id: 'generated-1',
+    });
+    codexServiceMock.list.mockResolvedValue([codexEntry]);
+    aiServiceMock.chat.mockResolvedValue({
+      text: JSON.stringify({
+        suggestions: [
+          {
+            kind: 'character',
+            title: 'Mira Vale',
+            description: 'A cartographer.',
+            tags: [],
+            fields: {},
+            evidence: 'A cartographer from the northern coast.',
+          },
+        ],
+      }),
+      model: 'test-model',
+    });
+    render(<App />);
+    await user.click(
+      within(await screen.findByRole('article')).getByRole('button', {
+        name: /The Quiet Map Updated/,
+      }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: 'Suggest Codex from scene' }),
+    );
+    const textReview = screen.getByRole('textbox', { name: 'Text to analyze for Codex' });
+    await user.clear(textReview);
+    await user.type(textReview, 'A cartographer from the northern coast.');
+    await user.click(screen.getByRole('button', { name: 'Send reviewed text' }));
+    await screen.findByRole('region', { name: 'Review Codex suggestions' });
+    await user.click(screen.getByRole('button', { name: 'Check duplicate' }));
+    await waitFor(() => expect(screen.getByText(/Possible duplicate/)).toBeVisible());
+    expect(screen.getByRole('button', { name: 'Keep separate and add' })).toBeVisible();
+    expect(codexServiceMock.createWithSources).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Skip' }));
+    expect(
+      screen.queryByRole('region', { name: 'Review Codex suggestions' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not send Codex extraction output without evidence from the reviewed source', async () => {
+    const user = userEvent.setup();
+    projectServiceMock.listProjects.mockResolvedValue([project]);
+    aiServiceMock.chat.mockResolvedValue({
+      text: JSON.stringify({
+        suggestions: [
+          {
+            kind: 'character',
+            title: 'Unsupported',
+            description: 'Not in text',
+            tags: [],
+            fields: {},
+            evidence: 'an excerpt that is absent',
+          },
+        ],
+      }),
+      model: 'test-model',
+    });
+    render(<App />);
+    await user.click(
+      within(await screen.findByRole('article')).getByRole('button', {
+        name: /The Quiet Map Updated/,
+      }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: 'Suggest Codex from scene' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Send reviewed text' }));
+    expect(
+      await screen.findByText('No valid Codex suggestions were returned.'),
+    ).toBeVisible();
+    expect(codexServiceMock.createWithSources).not.toHaveBeenCalled();
+  });
+
+  it('creates a custom writing theme and applies its font choice', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Create theme' }));
+    await user.clear(screen.getByRole('textbox', { name: 'Writing theme name' }));
+    await user.type(
+      screen.getByRole('textbox', { name: 'Writing theme name' }),
+      'My Theme',
+    );
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Writing font' }),
+      'Source Serif 4',
+    );
+    expect(screen.getByRole('textbox', { name: 'Writing theme name' })).toHaveValue(
+      'My Theme',
+    );
+    expect(screen.getByRole('combobox', { name: 'Writing font' })).toHaveValue(
+      'Source Serif 4',
+    );
+    expect(JSON.parse(localStorage.getItem('noveler-writing-themes') ?? '[]')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'My Theme', fontFamily: 'Source Serif 4' }),
+      ]),
+    );
+  });
+
+  it('loads and saves custom writing themes using native appearance settings', async () => {
+    const custom = {
+      id: 'custom-native',
+      name: 'Native',
+      background: '#ffffff',
+      foreground: '#111111',
+      fontFamily: 'Literata',
+      fontSize: 18,
+      lineHeight: 1.8,
+      contentWidth: 760,
+    };
+    aiServiceMock.getAppearanceSettings.mockResolvedValue({
+      version: 1,
+      themes: [custom],
+      selectedThemeId: custom.id,
+      theme: 'dark',
+      textScale: '1.3',
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Timeline' })).toBeVisible(),
+    );
+    await waitFor(() =>
+      expect(document.documentElement).toHaveAttribute('data-theme', 'dark'),
+    );
+    await waitFor(() =>
+      expect(document.documentElement.style.getPropertyValue('--ui-scale')).toBe('1.3'),
+    );
+    await waitFor(() =>
+      expect(aiServiceMock.saveAppearanceSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themes: [custom],
+          selectedThemeId: custom.id,
+          theme: 'dark',
+          textScale: '1.3',
+        }),
+      ),
+    );
   });
 
   it('creates and opens a saved local project with its chapter and scene', async () => {
@@ -438,15 +759,21 @@ describe('application shell', () => {
     projectServiceMock.listProjects.mockResolvedValue([project]);
     projectServiceMock.openProject.mockResolvedValue({
       ...detail,
-      chapters: [{ ...detail.chapters[0], scenes: [...detail.chapters[0].scenes, secondScene] }],
+      chapters: [
+        { ...detail.chapters[0], scenes: [...detail.chapters[0].scenes, secondScene] },
+      ],
     });
     render(<App />);
     const card = await screen.findByRole('article');
     await user.click(within(card).getByRole('button', { name: /The Quiet Map Updated/ }));
     await user.click(screen.getByRole('button', { name: 'Edit whole chapter' }));
 
-    const first = screen.getByRole('textbox', { name: 'Text for The Arrival in First Chapter' });
-    const second = screen.getByRole('textbox', { name: 'Text for The Crossing in First Chapter' });
+    const first = screen.getByRole('textbox', {
+      name: 'Text for The Arrival in First Chapter',
+    });
+    const second = screen.getByRole('textbox', {
+      name: 'Text for The Crossing in First Chapter',
+    });
     expect(first).toHaveValue('A remembered opening.');
     expect(second).toHaveValue('Second scene passage.');
     expect(screen.getByRole('heading', { name: 'Scene · The Arrival' })).toBeVisible();
@@ -454,14 +781,23 @@ describe('application shell', () => {
 
     await user.clear(first);
     await user.type(first, 'Revised chapter passage.');
-    await waitFor(() => expect(projectServiceMock.saveSceneContent).toHaveBeenCalledWith(
-      'scene-1',
-      expect.stringContaining('Revised chapter passage.'),
-    ), { timeout: 2000 });
-    const savedContent = projectServiceMock.saveSceneContent.mock.calls.at(-1)?.[1] as string;
+    await waitFor(
+      () =>
+        expect(projectServiceMock.saveSceneContent).toHaveBeenCalledWith(
+          'scene-1',
+          expect.stringContaining('Revised chapter passage.'),
+        ),
+      { timeout: 2000 },
+    );
+    const savedContent = projectServiceMock.saveSceneContent.mock.calls.at(
+      -1,
+    )?.[1] as string;
     expect(savedContent).not.toContain('Scene · The Arrival');
     expect(savedContent).not.toContain('Scene · The Crossing');
-    expect(projectServiceMock.saveSceneContent).not.toHaveBeenCalledWith('scene-2', expect.any(String));
+    expect(projectServiceMock.saveSceneContent).not.toHaveBeenCalledWith(
+      'scene-2',
+      expect.any(String),
+    );
   });
 
   it('retains draft text and announces an autosave failure with a retry action', async () => {
@@ -645,6 +981,27 @@ describe('application shell', () => {
     expect(screen.getByRole('textbox', { name: 'Endpoint' })).toHaveValue(
       'http://127.0.0.1:11434/v1',
     );
+  });
+
+  it('lists local Ollama models and lets the user select one', async () => {
+    const user = userEvent.setup();
+    aiServiceMock.listOllamaModels.mockResolvedValue(['llama3.2:latest', 'mistral']);
+    render(<App />);
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const provider = await screen.findByRole('combobox', { name: 'Provider' });
+    await user.selectOptions(provider, 'ollama');
+    await user.click(
+      await screen.findByRole('button', { name: 'List available models' }),
+    );
+
+    await waitFor(() =>
+      expect(aiServiceMock.listOllamaModels).toHaveBeenCalledWith(
+        'http://127.0.0.1:11434/v1',
+      ),
+    );
+    const modelSelect = await screen.findByRole('combobox', { name: 'Model' });
+    await user.selectOptions(modelSelect, 'mistral');
+    expect(modelSelect).toHaveValue('mistral');
   });
 
   it('does not silently delete a saved OpenAI key when switching to Ollama and back', async () => {
