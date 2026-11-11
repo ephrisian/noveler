@@ -1,0 +1,30 @@
+[package]
+name = "noveler"
+version = "0.1.0"
+description = "A local-first desktop writing studio"
+authors = ["Noveler contributors"]
+edition = "2021"
+
+[lib]
+name = "noveler_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+keyring = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
